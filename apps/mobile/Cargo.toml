@@ -1,0 +1,26 @@
+[package]
+name = "zhihu-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "zhihu_mobile"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+gpui-kit = { workspace = true }
+zhihu-ui = { path = "../../crates/zhihu-ui" }
+log = "0.4"
+gpui_pre_reqwest = { workspace = true }
+reqwest_client = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+gpui-mobile = { workspace = true }
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+gpui-mobile = { workspace = true }
+objc2 = "0.6"

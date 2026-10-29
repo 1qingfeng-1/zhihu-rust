@@ -1,0 +1,42 @@
+{
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.formatOnSave": true,
+    },
+    // vim base settings can go here
+    // leader - prefix key
+    "vim.enableNeovim": true,
+    "vim.leader": "<space>",
+    // To improve performance
+    "extensions.experimental.affinity": {
+        "vscodevim.vim": 1
+    },
+    // Easy motion
+    "vim.easymotion": true,
+    // Use system clipboard
+    "vim.useSystemClipboard": true,
+    // 由vim接管ctrl+any的按键，而不是vscode
+    "vim.useCtrlKeys": true,
+    "vim.replaceWithRegister": false,
+    // 忽略大小写
+    "vim.ignorecase": true,
+    "vim.smartcase": true,
+    // 智能行号
+    "vim.smartRelativeLine": true,
+    "vim.foldfix": true,
+    // Highlight search
+    "vim.hlsearch": true,
+    "vim.highlightedyank.enable": true,
+    "vim.highlightedyank.duration": 500,
+    "vim.handleKeys": {
+        "<C-d>": false, 
+        "<C-f>": false, 
+        "<C-e>": false, 
+        "<C-s>": false,
+        "<C-z>": false,
+        "<C-a>": false,
+        "<C-c>": false,
+        "<C-v>": false,
+        "<C-x>": false,
+    },
+}

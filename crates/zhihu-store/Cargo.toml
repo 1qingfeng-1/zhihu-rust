@@ -1,0 +1,13 @@
+[package]
+name = "zhihu-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+zhihu-types = { path = "../zhihu-types" }
+zhihu-recommend = { path = "../zhihu-recommend" }
+thiserror = { workspace = true }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+serde_json = { workspace = true }

@@ -1,0 +1,17 @@
+/target
+/dist
+/android/.gradle
+/android/build
+/android/app/build
+/android/app/src/main/jniLibs
+/android/local.properties
+/android/keystore.properties
+*.jks
+*.keystore
+.idea/
+*.iml
+.DS_Store
+.cargo/
+
+# local upstream extraction scratch
+vendor/_kit_tmp/

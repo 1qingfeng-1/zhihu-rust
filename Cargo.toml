@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+# Vendored snapshots have their own workspace manifests and must not be
+# auto-included as members of this workspace.
+exclude = ["vendor/gpui-kit", "vendor/gpui-mobile"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+authors = ["AiZen"]
+repository = "https://github.com/1qingfeng-1/zhihu-rust"
+
+[workspace.dependencies]
+# IMPORTANT: gpui-kit 0.8.x depends on gpui-pre 0.3.10, while gpui-mobile pins
+# gpui-pre 0.3.6. Keep this triple in sync (see docs/REWRITE_PLAN.md §3.1).
+# Vendored snapshot of github.com/longbridge/gpui-kit @ 13c716b (0.6.5).
+# The published 0.6.5 is yanked and the git remote is unreachable here.
+gpui-kit = { path = "vendor/gpui-kit/crates/kit", default-features = false, features = ["component", "assets"] }
+# Vendored snapshot of github.com/itsbalamurali/gpui-mobile @ 5fd54f4
+# (the crates.io 0.1.0 package is a name-reservation placeholder).
+gpui-mobile = { path = "vendor/gpui-mobile" }
+# LaTeX typesetting for GPUI (render-only: no editor).
+ratex-gpui = { version = "0.4.1", default-features = false }
+reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.6" }
+gpui_pre_reqwest = { package = "gpui-pre-reqwest", version = "=0.12.15", default-features = false, features = ["rustls-tls-webpki-roots"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
