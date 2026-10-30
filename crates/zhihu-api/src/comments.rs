@@ -23,6 +23,7 @@ fn author_of(value: Option<&Value>) -> Author {
             url_token: None,
             is_following: false,
             avatar_url: None,
+            is_mcn: false,
         };
     };
     Author {
@@ -46,10 +47,15 @@ fn author_of(value: Option<&Value>) -> Author {
         avatar_url: string_at(author, &["avatar_url", "avatarUrl"])
             .or_else(|| string_at(author, &["avatar_url_template", "avatarUrlTemplate"]))
             .map(|url| url.replace("{size}", "xl")),
+        is_mcn: is_mcn_author(author),
     }
 }
 
-fn parse_comment(value: &Value) -> Option<Comment> {
+fn is_mcn_author(value: &Value) -> bool {
+    crate::feed::is_mcn_author(value)
+}
+
+pub fn parse_comment(value: &Value) -> Option<Comment> {
     if value
         .get("is_delete")
         .and_then(Value::as_bool)
@@ -79,6 +85,17 @@ fn parse_comment(value: &Value) -> Option<Comment> {
             .get("is_author")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        is_mine: value
+            .get("is_mine")
+            .or_else(|| {
+                value
+                    .get("relationship")
+                    .and_then(|relationship| relationship.get("is_mine"))
+            })
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        root_id: string_at(value, &["reply_root_comment_id", "root_comment_id"])
+            .map(str::to_string),
         children: value
             .get("child_comments")
             .and_then(Value::as_array)
@@ -114,9 +131,9 @@ pub fn parse_comments_page(value: &Value) -> CommentsPage {
     }
 }
 
-/// Parse the legacy v4 comment list. Zhihu currently returns an empty `data`
-/// array from the v5 `comment_v5` endpoint for some accounts while v4 still
-/// returns the full page, so the client prefers v4.
+/// Parse the legacy v4 comment list. Zhihu intermittently returns an empty
+/// `data` array from the v5 `comment_v5` endpoint while v4 still returns the
+/// full page, so the client falls back to this mapper for answers/articles.
 pub fn parse_comments_v4_page(value: &Value) -> CommentsPage {
     let items: Vec<Comment> = value
         .get("data")
@@ -156,9 +173,12 @@ pub fn parse_comments_v4_page(value: &Value) -> CommentsPage {
                 author: Author {
                     id: member
                         .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                        .and_then(|id| {
+                            id.as_str()
+                                .map(str::to_string)
+                                .or_else(|| id.as_i64().map(|value| value.to_string()))
+                        })
+                        .unwrap_or_default(),
                     name,
                     headline: member
                         .get("headline")
@@ -175,6 +195,7 @@ pub fn parse_comments_v4_page(value: &Value) -> CommentsPage {
                         .and_then(Value::as_str)
                         .or_else(|| member.get("avatar_url_template").and_then(Value::as_str))
                         .map(|url| url.replace("{size}", "xl")),
+                    is_mcn: is_mcn_author(member),
                 },
                 reply_to,
                 like_count: item
@@ -194,6 +215,14 @@ pub fn parse_comments_v4_page(value: &Value) -> CommentsPage {
                     .get("is_author")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                is_mine: item
+                    .get("is_mine")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                root_id: item
+                    .get("reply_root_comment_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 children: Vec::new(),
                 child_next_offset: None,
             })

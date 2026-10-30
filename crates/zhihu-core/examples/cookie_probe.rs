@@ -35,6 +35,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ZhihuClient::new()?;
     client.set_cookies(cookies);
 
+    if std::env::var("ZHIHU_MCN_PROBE").is_ok() {
+        fn scan(value: &serde_json::Value, path: &str, hits: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, item) in map {
+                        let next = format!("{path}.{key}");
+                        if key.to_lowercase().contains("mcn") {
+                            hits.push(format!("{next} = {item}"));
+                        }
+                        scan(item, &next, hits);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        scan(item, &format!("{path}[{index}]"), hits);
+                    }
+                }
+                serde_json::Value::String(text) if text.to_lowercase().contains("mcn") => {
+                    hits.push(format!("{path} = {text:?}"));
+                }
+                _ => {}
+            }
+        }
+        let mut targets = vec![
+            "https://www.zhihu.com/api/v3/feed/topstory/recommend?desktop=true&limit=20"
+                .to_string(),
+            "https://www.zhihu.com/api/v3/moments?limit=20&desktop=true".to_string(),
+        ];
+        for (index, query) in ["MCN", "MCN机构", "知乎 MCN"].iter().enumerate() {
+            targets.push(format!(
+                "https://www.zhihu.com/api/v4/search_v3?t=general&q={}&correction=1&offset=0&limit=20&search_source=Normal",
+                query.replace(' ', "%20")
+            ));
+            let _ = index;
+        }
+        for url in targets {
+            match client.get_json(&url, true).await {
+                Ok(value) => {
+                    let mut hits = Vec::new();
+                    scan(&value, "root", &mut hits);
+                    println!("MCN probe {url}: {} hits", hits.len());
+                    for hit in hits.into_iter().take(30) {
+                        println!("  {hit}");
+                    }
+                }
+                Err(error) => println!("MCN probe {url} failed: {error}"),
+            }
+        }
+        return Ok(());
+    }
+
+    if let Ok(url) = std::env::var("ZHIHU_PROBE_TEXT_URL") {
+        match client.get_text(&url).await {
+            Ok(text) => println!(
+                "text probe {url} OK: {} bytes, head={:?}",
+                text.len(),
+                text.chars().take(500).collect::<String>()
+            ),
+            Err(error) => println!("text probe {url} failed: {error}"),
+        }
+        return Ok(());
+    }
+
+    if let Ok(url) = std::env::var("ZHIHU_PROBE_URL") {
+        match client.get_json(&url, true).await {
+            Ok(value) => println!(
+                "probe {url} OK: {}",
+                serde_json::to_string(&value)?
+                    .chars()
+                    .take(2000)
+                    .collect::<String>()
+            ),
+            Err(error) => println!("probe {url} failed: {error}"),
+        }
+        return Ok(());
+    }
+
     match client.me_profile().await {
         Ok(profile) => println!("me OK: {} ({:?})", profile.name, profile.url_token),
         Err(error) => println!("me failed: {error}"),
@@ -53,6 +130,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match client.feed_recommend_items(2).await {
         Ok((items, is_end)) => println!("feed page 2: {} items, is_end={is_end}", items.len()),
         Err(error) => println!("feed page 2 failed: {error}"),
+    }
+
+    for kind in [
+        zhihu_types::FollowFeedKind::Recommend,
+        zhihu_types::FollowFeedKind::Activity,
+    ] {
+        match client.follow_feed(kind, None).await {
+            Ok(page) => {
+                println!(
+                    "follow {} OK: {} items, is_end={}, next={:?}, first={:?}",
+                    kind.label(),
+                    page.items.len(),
+                    page.is_end,
+                    page.next,
+                    page.items.first().map(|item| item.title.as_str())
+                );
+                if let Some(next) = page.next {
+                    match client.follow_feed(kind, Some(&next)).await {
+                        Ok(page) => println!(
+                            "follow {} page 2: {} items, is_end={}",
+                            kind.label(),
+                            page.items.len(),
+                            page.is_end
+                        ),
+                        Err(error) => println!("follow {} page 2 failed: {error}", kind.label()),
+                    }
+                }
+            }
+            Err(error) => println!("follow {} failed: {error}", kind.label()),
+        }
+    }
+
+    let topic_id = feed
+        .iter()
+        .flat_map(|item| item.topic_refs.iter())
+        .find(|topic| !topic.id.is_empty())
+        .map(|topic| topic.id.clone())
+        .unwrap_or_else(|| "19776749".to_string());
+    match client.topic_detail(&topic_id).await {
+        Ok(topic) => println!(
+            "topic detail OK: {} / {} followers / following={}",
+            topic.name, topic.followers_count, topic.is_following
+        ),
+        Err(error) => println!("topic detail failed: {error}"),
+    }
+    for (tab, sort) in [
+        (
+            zhihu_types::TopicFeedTab::Discussion,
+            zhihu_types::TopicSort::Essence,
+        ),
+        (
+            zhihu_types::TopicFeedTab::Ideas,
+            zhihu_types::TopicSort::Latest,
+        ),
+        (
+            zhihu_types::TopicFeedTab::Unanswered,
+            zhihu_types::TopicSort::Hot,
+        ),
+    ] {
+        match client.topic_feed(&topic_id, tab, sort, None).await {
+            Ok(page) => println!(
+                "topic {} OK: {} items, is_end={}, first={:?}",
+                tab.label(),
+                page.items.len(),
+                page.is_end,
+                page.items.first().map(|item| item.title.as_str())
+            ),
+            Err(error) => println!("topic {} failed: {error}", tab.label()),
+        }
     }
 
     let detail = feed

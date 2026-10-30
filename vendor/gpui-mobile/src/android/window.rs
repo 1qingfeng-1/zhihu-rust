@@ -1487,6 +1487,11 @@ impl PlatformWindow for AndroidPlatformWindow {
                 id
             };
             let mut active_touches = HashMap::new();
+            // Raw contacts kept for pinch recognition: GPUI's touch recognizer
+            // only reports single-finger pans, so two-finger scale has to be
+            // derived here and surfaced as `PlatformInput::Pinch`.
+            let mut raw_contacts: HashMap<i32, (f32, f32)> = HashMap::new();
+            let mut pinch_last: Option<f32> = None;
             let mut fling_guard = crate::fling_guard::FlingGuard::new();
             self.window.on_touch(move |touch| {
                 let phase = match touch.action {
@@ -1511,6 +1516,37 @@ impl PlatformWindow for AndroidPlatformWindow {
                     return;
                 };
                 let scale = window.scale_factor();
+
+                if matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
+                    raw_contacts.remove(&touch.id);
+                } else {
+                    raw_contacts.insert(touch.id, (touch.x, touch.y));
+                }
+                if raw_contacts.len() == 2 {
+                    let mut points = raw_contacts.values();
+                    let (x1, y1) = *points.next().expect("two contacts");
+                    let (x2, y2) = *points.next().expect("two contacts");
+                    let distance = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
+                    if let Some(previous) = pinch_last.filter(|distance| *distance > 1.0) {
+                        let ratio = distance / previous;
+                        if (ratio - 1.0).abs() >= 0.01 {
+                            let mut pinch_cb = cb.lock();
+                            let _ = pinch_cb(gpui::PlatformInput::Pinch(gpui::PinchEvent {
+                                position: gpui::point(
+                                    gpui::px((x1 + x2) * 0.5 / scale),
+                                    gpui::px((y1 + y2) * 0.5 / scale),
+                                ),
+                                delta: ratio - 1.0,
+                                modifiers: gpui::Modifiers::default(),
+                                phase: gpui::TouchPhase::Moved,
+                            }));
+                        }
+                    }
+                    pinch_last = Some(distance);
+                } else if raw_contacts.len() < 2 {
+                    pinch_last = None;
+                }
+
                 let event = gpui::TouchEvent {
                     id,
                     phase,

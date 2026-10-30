@@ -710,22 +710,27 @@ pub fn run_event_loop(app: &AndroidApp) {
     // Vsync pacing lives on this thread's looper.
     super::frame_source::install();
     let mut iteration: u64 = 0;
+    // Debug-only liveness heartbeat: compiled out of release builds so an
+    // idle app does not write a log line every few seconds.
+    #[cfg(debug_assertions)]
     let mut last_heartbeat = std::time::Instant::now();
     let mut app_is_active = false;
 
     loop {
         iteration += 1;
 
-        // Log a heartbeat every 5 seconds so we can tell if the loop is alive.
-        let now = std::time::Instant::now();
-        if now.duration_since(last_heartbeat) >= Duration::from_secs(5) {
-            log::info!(
-                "run_event_loop: heartbeat — iteration={}, init_done={}, active={}",
-                iteration,
-                INIT_WINDOW_DONE.load(Ordering::Relaxed),
-                app_is_active,
-            );
-            last_heartbeat = now;
+        #[cfg(debug_assertions)]
+        {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_heartbeat) >= Duration::from_secs(60) {
+                log::debug!(
+                    "run_event_loop: heartbeat — iteration={}, init_done={}, active={}",
+                    iteration,
+                    INIT_WINDOW_DONE.load(Ordering::Relaxed),
+                    app_is_active,
+                );
+                last_heartbeat = now;
+            }
         }
 
         // Check if quit was requested.

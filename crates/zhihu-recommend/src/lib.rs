@@ -13,9 +13,27 @@ use std::collections::HashMap;
 
 use zhihu_types::FeedItem;
 
+pub mod collect;
+pub mod embedding;
+#[cfg(feature = "onnx")]
+pub mod onnx;
+
+pub use collect::{
+    CancelToken, Candidate, CandidateKind, CollectReport, CollectSource, CollectorPolicy,
+    HiddenRules, RecommendPoolStats,
+};
+pub use embedding::{
+    cosine, item_key, normalize_vector, select_embedding_provider, EmbeddingError,
+    EmbeddingProvider, EmbeddingResult, HashEmbeddingProvider, VectorProfile,
+};
+#[cfg(feature = "onnx")]
+pub use onnx::OnnxEmbeddingProvider;
+
 const TOPIC_WEIGHT_CAP: f32 = 5.0;
 const AUTHOR_WEIGHT_CAP: f32 = 5.0;
-const HALF_LIFE_DAYS: f32 = 30.0;
+/// Feedback weight halves every this many days.
+pub const FEEDBACK_HALF_LIFE_DAYS: f32 = 30.0;
+const HALF_LIFE_DAYS: f32 = FEEDBACK_HALF_LIFE_DAYS;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecommendMode {
@@ -54,7 +72,133 @@ impl RecommendMode {
     }
 }
 
-/// One explicitly recorded interaction, already attributed to topics/author.
+/// Fixed ranking presets (M8-2). Users pick a mode, never raw weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecommendPreset {
+    /// Relevance, quality, freshness, author affinity and diversity.
+    #[default]
+    Balanced,
+    /// Prefer known topics/authors, less exploration.
+    Focused,
+    /// Favour unseen authors and fresh items, more diversity.
+    Explore,
+    /// Time first; blocks and negative feedback still filter.
+    Fresh,
+}
+
+impl RecommendPreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecommendPreset::Balanced => "balanced",
+            RecommendPreset::Focused => "focused",
+            RecommendPreset::Explore => "explore",
+            RecommendPreset::Fresh => "fresh",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "focused" => RecommendPreset::Focused,
+            "explore" => RecommendPreset::Explore,
+            "fresh" => RecommendPreset::Fresh,
+            _ => RecommendPreset::Balanced,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RecommendPreset::Balanced => "均衡",
+            RecommendPreset::Focused => "专注",
+            RecommendPreset::Explore => "探索",
+            RecommendPreset::Fresh => "新鲜",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            RecommendPreset::Balanced => "相关性、质量、新鲜度与作者亲和度平衡",
+            RecommendPreset::Focused => "更看重已关注的主题与作者",
+            RecommendPreset::Explore => "多给新作者和新鲜内容机会",
+            RecommendPreset::Fresh => "优先最近采集的内容",
+        }
+    }
+
+    pub fn weights(self) -> PresetWeights {
+        match self {
+            RecommendPreset::Balanced => PresetWeights {
+                relevance: 0.55,
+                author: 0.20,
+                quality: 0.15,
+                freshness: 0.10,
+                novelty: 0.0,
+            },
+            RecommendPreset::Focused => PresetWeights {
+                relevance: 0.68,
+                author: 0.25,
+                quality: 0.05,
+                freshness: 0.02,
+                novelty: 0.0,
+            },
+            RecommendPreset::Explore => PresetWeights {
+                relevance: 0.25,
+                author: 0.05,
+                quality: 0.10,
+                freshness: 0.25,
+                novelty: 0.35,
+            },
+            RecommendPreset::Fresh => PresetWeights {
+                relevance: 0.15,
+                author: 0.10,
+                quality: 0.15,
+                freshness: 0.60,
+                novelty: 0.0,
+            },
+        }
+    }
+
+    /// Multiplier for the greedy diversity penalty.
+    pub fn diversity_scale(self) -> f32 {
+        match self {
+            RecommendPreset::Balanced => 1.0,
+            RecommendPreset::Focused => 0.6,
+            RecommendPreset::Explore => 1.8,
+            RecommendPreset::Fresh => 1.0,
+        }
+    }
+
+    /// How much of the final score comes from vector similarity when a
+    /// [`VectorProfile`] is available. Statistical features keep the rest.
+    pub fn vector_weight(self) -> f32 {
+        match self {
+            RecommendPreset::Balanced => 0.25,
+            RecommendPreset::Focused => 0.30,
+            RecommendPreset::Explore => 0.10,
+            RecommendPreset::Fresh => 0.10,
+        }
+    }
+
+    pub const ALL: [RecommendPreset; 4] = [
+        RecommendPreset::Balanced,
+        RecommendPreset::Focused,
+        RecommendPreset::Explore,
+        RecommendPreset::Fresh,
+    ];
+}
+
+/// Fixed weights for one preset. Each set sums to 1.0.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PresetWeights {
+    pub relevance: f32,
+    pub author: f32,
+    pub quality: f32,
+    pub freshness: f32,
+    /// Unseen-author bonus; only the explore preset uses it.
+    pub novelty: f32,
+}
+
+/// Freshness falls to zero after this window in the local pool.
+const FRESHNESS_WINDOW_DAYS: f32 = 7.0;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedbackRecord {
     pub author_id: String,
@@ -114,19 +258,53 @@ struct Scored {
     position: usize,
 }
 
-/// Reorder `items` in place. `Off` and cold-start profiles keep the server
-/// order untouched.
+/// Reorder `items` in place using the balanced preset.
 pub fn rerank(items: &mut Vec<FeedItem>, profile: &InterestProfile, mode: RecommendMode) {
-    if mode == RecommendMode::Off || items.len() < 2 || profile.is_empty() {
+    rerank_with_preset(items, profile, mode, RecommendPreset::Balanced);
+}
+
+/// Preset-aware rerank of a server list. `Off` and cold-start profiles keep
+/// the server order untouched.
+pub fn rerank_with_preset(
+    items: &mut Vec<FeedItem>,
+    profile: &InterestProfile,
+    mode: RecommendMode,
+    preset: RecommendPreset,
+) {
+    rerank_with_vectors(items, profile, mode, preset, None);
+}
+
+/// Preset-aware rerank that also blends vector similarity when available.
+/// Items without an embedding keep the statistical score.
+pub fn rerank_with_vectors(
+    items: &mut Vec<FeedItem>,
+    profile: &InterestProfile,
+    mode: RecommendMode,
+    preset: RecommendPreset,
+    vectors: Option<&VectorProfile>,
+) {
+    if mode == RecommendMode::Off || items.len() < 2 || (profile.is_empty() && vectors.is_none()) {
         return;
     }
+    let weights = preset.weights();
+    let vector_weight = preset.vector_weight();
     let total = items.len();
-    let mut scored: Vec<Scored> = items
+    let scored: Vec<Scored> = items
         .drain(..)
         .enumerate()
         .map(|(position, item)| {
-            let local = local_score(&item, profile, position, total);
-            let server = 1.0 - position as f32 / (total - 1) as f32;
+            let freshness = 1.0 - position as f32 / (total - 1) as f32;
+            let similarity =
+                vectors.and_then(|vectors| vectors.similarity(item.kind.as_str(), &item.id));
+            let local = score_item(
+                &item,
+                profile,
+                freshness,
+                weights,
+                similarity,
+                vector_weight,
+            );
+            let server = freshness;
             let score = match mode {
                 RecommendMode::Hybrid => 0.55 * local + 0.45 * server,
                 RecommendMode::Local => local,
@@ -139,13 +317,71 @@ pub fn rerank(items: &mut Vec<FeedItem>, profile: &InterestProfile, mode: Recomm
             }
         })
         .collect();
+    *items = greedy_order(scored, preset.diversity_scale(), total);
+}
 
-    let mut output: Vec<FeedItem> = Vec::with_capacity(total);
-    while !scored.is_empty() {
+/// Build a local feed from the collected candidate pool.
+///
+/// Uses the same preset weights as [`rerank_with_preset`], with collection age
+/// driving freshness; daily stories are skipped because they have no content
+/// route. A cold-start (empty) profile is fine: quality and freshness still
+/// order the pool.
+pub fn rank_pool(
+    candidates: &[Candidate],
+    profile: &InterestProfile,
+    preset: RecommendPreset,
+    now: i64,
+    limit: usize,
+) -> Vec<FeedItem> {
+    rank_pool_with_vectors(candidates, profile, preset, now, limit, None)
+}
+
+/// Local pool ranking with optional vector similarity.
+pub fn rank_pool_with_vectors(
+    candidates: &[Candidate],
+    profile: &InterestProfile,
+    preset: RecommendPreset,
+    now: i64,
+    limit: usize,
+    vectors: Option<&VectorProfile>,
+) -> Vec<FeedItem> {
+    let weights = preset.weights();
+    let vector_weight = preset.vector_weight();
+    let scored: Vec<Scored> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(position, candidate)| {
+            let item = candidate.to_feed_item()?;
+            let age_days = ((now - candidate.collected_at).max(0) as f32) / 86_400.0;
+            let freshness = (1.0 - age_days / FRESHNESS_WINDOW_DAYS).clamp(0.0, 1.0);
+            let similarity = vectors
+                .and_then(|vectors| vectors.similarity(candidate.kind.as_str(), &candidate.id));
+            let score = score_item(
+                &item,
+                profile,
+                freshness,
+                weights,
+                similarity,
+                vector_weight,
+            );
+            Some(Scored {
+                item,
+                score,
+                position,
+            })
+        })
+        .collect();
+    greedy_order(scored, preset.diversity_scale(), limit)
+}
+
+fn greedy_order(mut scored: Vec<Scored>, diversity_scale: f32, limit: usize) -> Vec<FeedItem> {
+    let mut output: Vec<FeedItem> = Vec::with_capacity(scored.len().min(limit));
+    while !scored.is_empty() && output.len() < limit {
         let mut best_index = 0;
         let mut best_score = f32::NEG_INFINITY;
         for (index, candidate) in scored.iter().enumerate() {
-            let adjusted = candidate.score - diversity_penalty(&candidate.item, &output);
+            let penalty = diversity_scale * diversity_penalty(&candidate.item, &output);
+            let adjusted = candidate.score - penalty;
             let better = adjusted > best_score + 1e-6
                 || ((adjusted - best_score).abs() <= 1e-6
                     && candidate.position < scored[best_index].position);
@@ -156,7 +392,7 @@ pub fn rerank(items: &mut Vec<FeedItem>, profile: &InterestProfile, mode: Recomm
         }
         output.push(scored.remove(best_index).item);
     }
-    *items = output;
+    output
 }
 
 pub fn title_tokens(title: &str) -> Vec<String> {
@@ -270,7 +506,14 @@ fn is_function_char(ch: char) -> bool {
     )
 }
 
-fn local_score(item: &FeedItem, profile: &InterestProfile, position: usize, total: usize) -> f32 {
+fn score_item(
+    item: &FeedItem,
+    profile: &InterestProfile,
+    freshness: f32,
+    weights: PresetWeights,
+    vector_similarity: Option<f32>,
+    vector_weight: f32,
+) -> f32 {
     let topic_sum: f32 = item
         .topics
         .iter()
@@ -289,8 +532,23 @@ fn local_score(item: &FeedItem, profile: &InterestProfile, position: usize, tota
             .min(1.0)
     };
     let quality = ((1.0 + item.vote_up_count as f32).ln() / 12.0).min(1.0);
-    let freshness = 1.0 - position as f32 / (total - 1) as f32;
-    0.60 * topic + 0.25 * author + 0.10 * quality + 0.05 * freshness
+    let novelty = if weights.novelty > 0.0
+        && (item.author.id.is_empty() || !profile.authors.contains_key(&item.author.id))
+    {
+        1.0
+    } else {
+        0.0
+    };
+    let base = weights.relevance * topic
+        + weights.author * author
+        + weights.quality * quality
+        + weights.freshness * freshness
+        + weights.novelty * novelty;
+    let Some(similarity) = vector_similarity else {
+        return base;
+    };
+    let vector = (similarity + 1.0) * 0.5;
+    ((1.0 - vector_weight) * base + vector_weight * vector).clamp(0.0, 1.0)
 }
 
 fn diversity_penalty(item: &FeedItem, output: &[FeedItem]) -> f32 {
@@ -344,11 +602,14 @@ mod tests {
                 url_token: None,
                 is_following: false,
                 avatar_url: None,
+                is_mcn: false,
             },
             kind: ContentKind::Answer,
             vote_up_count: votes,
             comment_count: 1,
+            created_at: 0,
             topics: vec![topic.to_string()],
+            topic_refs: Vec::new(),
         }
     }
 
@@ -383,6 +644,188 @@ mod tests {
             assert_eq!(RecommendMode::parse(mode.as_str()), mode);
         }
         assert_eq!(RecommendMode::parse("unknown"), RecommendMode::Off);
+    }
+
+    #[test]
+    fn presets_roundtrip_and_weights_sum_to_one() {
+        for preset in RecommendPreset::ALL {
+            assert_eq!(RecommendPreset::parse(preset.as_str()), preset);
+            let weights = preset.weights();
+            let sum = weights.relevance
+                + weights.author
+                + weights.quality
+                + weights.freshness
+                + weights.novelty;
+            assert!((sum - 1.0).abs() < 1e-4, "{preset:?} sums to {sum}");
+        }
+        assert_eq!(RecommendPreset::parse("unknown"), RecommendPreset::Balanced);
+    }
+
+    #[test]
+    fn focused_prefers_interest_and_fresh_prefers_time() {
+        let now = 1_000_000;
+        let profile = profile(&[("rust", 5.0)], &[], now);
+        let items = vec![
+            item("hot", "a", "go", 100_000),
+            item("match", "b", "rust", 1),
+        ];
+
+        let mut focused = items.clone();
+        rerank_with_preset(
+            &mut focused,
+            &profile,
+            RecommendMode::Local,
+            RecommendPreset::Focused,
+        );
+        assert_eq!(focused[0].id, "match");
+
+        let mut fresh = items;
+        rerank_with_preset(
+            &mut fresh,
+            &profile,
+            RecommendMode::Local,
+            RecommendPreset::Fresh,
+        );
+        assert_eq!(fresh[0].id, "hot");
+    }
+
+    #[test]
+    fn explore_boosts_unseen_authors() {
+        let now = 1_000_000;
+        let profile = profile(&[], &[("seen", 5.0)], now);
+        let items = vec![
+            item("seen-1", "seen", "rust", 10),
+            item("new-1", "new", "rust", 10),
+        ];
+
+        let mut balanced = items.clone();
+        rerank_with_preset(
+            &mut balanced,
+            &profile,
+            RecommendMode::Local,
+            RecommendPreset::Balanced,
+        );
+        assert_eq!(balanced[0].id, "seen-1");
+
+        let mut explore = items;
+        rerank_with_preset(
+            &mut explore,
+            &profile,
+            RecommendMode::Local,
+            RecommendPreset::Explore,
+        );
+        assert_eq!(explore[0].id, "new-1");
+    }
+
+    #[test]
+    fn vector_profile_breaks_score_ties() {
+        let provider = HashEmbeddingProvider::default();
+        let now = 1_000_000;
+        let mut matching = candidate("match", CandidateKind::Answer, now);
+        matching.title = "Rust 移动端实践".to_string();
+        let mut unrelated = candidate("other", CandidateKind::Answer, now);
+        unrelated.title = "今天中午吃什么".to_string();
+
+        let mut items = std::collections::HashMap::new();
+        items.insert(
+            item_key("answer", "match"),
+            provider.embed_text(&matching.title),
+        );
+        items.insert(
+            item_key("answer", "other"),
+            provider.embed_text(&unrelated.title),
+        );
+        let vectors = VectorProfile::new(
+            provider.model_id().to_string(),
+            provider.embed_text("Rust 移动端性能优化"),
+            items,
+        );
+
+        let ranked = rank_pool_with_vectors(
+            &[unrelated.clone(), matching.clone()],
+            &InterestProfile::default(),
+            RecommendPreset::Balanced,
+            now,
+            10,
+            Some(&vectors),
+        );
+        assert_eq!(ranked[0].id, "match");
+
+        // Without vectors the equal scores keep the input order.
+        let plain = rank_pool(
+            &[unrelated, matching],
+            &InterestProfile::default(),
+            RecommendPreset::Balanced,
+            now,
+            10,
+        );
+        assert_eq!(plain[0].id, "other");
+    }
+
+    #[test]
+    fn rank_pool_maps_candidates_and_uses_time_freshness() {
+        let now = 1_000_000;
+        let mut old = candidate("old", CandidateKind::Answer, now - 8 * 86_400);
+        old.vote_up_count = 10;
+        let mut fresh = candidate("fresh", CandidateKind::Article, now);
+        fresh.vote_up_count = 10;
+        let daily = candidate("daily", CandidateKind::Daily, now);
+
+        let items = rank_pool(
+            &[old, fresh, daily],
+            &InterestProfile::default(),
+            RecommendPreset::Balanced,
+            now,
+            10,
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "fresh");
+        assert!(items.iter().all(|item| item.id != "daily"));
+        assert!(rank_pool(
+            &[candidate("a", CandidateKind::Pin, now)],
+            &InterestProfile::default(),
+            RecommendPreset::Balanced,
+            now,
+            0,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn pool_candidates_map_to_feed_items() {
+        let mut stored = candidate("42", CandidateKind::Question, 100);
+        stored.vote_up_count = 7;
+        stored.comment_count = 3;
+        stored.topics = vec!["Rust".to_string()];
+        let item = stored.to_feed_item().expect("routable candidate");
+        assert_eq!(item.id, "42");
+        assert_eq!(item.kind, ContentKind::Question);
+        assert_eq!(item.author.id, "u1");
+        assert_eq!(item.author.name, "alice");
+        assert_eq!(item.vote_up_count, 7);
+        assert_eq!(item.comment_count, 3);
+        assert_eq!(item.topics, vec!["Rust".to_string()]);
+        assert!(candidate("9", CandidateKind::Daily, 100)
+            .to_feed_item()
+            .is_none());
+    }
+
+    fn candidate(id: &str, kind: CandidateKind, collected_at: i64) -> Candidate {
+        Candidate {
+            kind,
+            id: id.to_string(),
+            title: format!("标题 {id}"),
+            excerpt: String::new(),
+            author_id: "u1".to_string(),
+            author_name: "alice".to_string(),
+            topics: Vec::new(),
+            vote_up_count: 0,
+            comment_count: 0,
+            is_mcn: false,
+            source: "recommend".to_string(),
+            collected_at,
+            expires_at: collected_at + 7 * 86_400,
+        }
     }
 
     #[test]
@@ -473,7 +916,10 @@ mod tests {
         );
         let mut items = vec![unrelated, second, first];
         rerank(&mut items, &profile, RecommendMode::Local);
-        assert_eq!(items[0].id, "1");
+        // Both title-matching items lead; exact vs partial ordering is left to
+        // the preset weights. The unrelated title stays last.
+        let top: Vec<&str> = items.iter().take(2).map(|item| item.id.as_str()).collect();
+        assert!(top.contains(&"1") && top.contains(&"2"), "top was {top:?}");
         assert_eq!(items[2].id, "3");
     }
 

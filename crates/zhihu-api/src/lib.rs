@@ -4,13 +4,16 @@
 //! (AGPL-3.0); see `sign.rs` and `docs/REWRITE_PLAN.md`.
 
 pub mod client;
+pub mod collections;
 pub mod comments;
 pub mod detail;
 pub mod feed;
+pub mod members;
 pub mod notifications;
 pub mod phone_crypto;
 pub mod phone_login;
 pub mod sign;
+pub mod topics;
 
 pub use client::{
     ApiError, QrLoginSession, QrScanStatus, Result, SearchOptions, SearchSort, SearchVertical,

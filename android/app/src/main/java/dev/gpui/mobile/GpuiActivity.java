@@ -85,8 +85,20 @@ public class GpuiActivity extends GpuiInputActivity {
      */
     @Override
     public void onBackPressed() {
-        // Intentional no-op: do not finish the activity.
+        // Pop a route in Rust; at the root, background the app like a normal
+        // Android launcher activity.
+        if (nativeCanGoBack()) {
+            nativeBack();
+        } else {
+            moveTaskToBack(true);
+        }
     }
+
+    /** Queue an Escape/back key into the Rust event loop. */
+    private static native void nativeBack();
+
+    /** Whether Rust has a route/overlay that can be dismissed. */
+    private static native boolean nativeCanGoBack();
 
     /**
      * Check if the native library is fully initialized.
@@ -116,12 +128,31 @@ public class GpuiActivity extends GpuiInputActivity {
     public boolean dispatchKeyEvent(KeyEvent event) {
         int keyCode = event.getKeyCode();
         switch (keyCode) {
+            case KeyEvent.KEYCODE_BACK:
+                if (event.getAction() == KeyEvent.ACTION_UP) {
+                    if (nativeCanGoBack()) {
+                        nativeBack();
+                    } else {
+                        moveTaskToBack(true);
+                    }
+                }
+                return true;
+
             case KeyEvent.KEYCODE_VOLUME_UP:
             case KeyEvent.KEYCODE_VOLUME_DOWN:
             case KeyEvent.KEYCODE_VOLUME_MUTE:
-                // Let the system handle volume keys (adjusts STREAM_MUSIC).
-                // Don't pass to NativeActivity's native input handler.
-                return super.dispatchKeyEvent(event);
+                // NativeActivity forwards keys to the Rust loop, which swallows
+                // them without changing the system volume. Adjust STREAM_MUSIC
+                // ourselves and consume the event.
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    int direction = keyCode == KeyEvent.KEYCODE_VOLUME_UP
+                            ? AudioManager.ADJUST_RAISE
+                            : keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+                                    ? AudioManager.ADJUST_LOWER
+                                    : AudioManager.ADJUST_TOGGLE_MUTE;
+                    GpuiTts.adjustVolume(direction);
+                }
+                return true;
 
             case KeyEvent.KEYCODE_MEDIA_PLAY:
             case KeyEvent.KEYCODE_MEDIA_PAUSE:

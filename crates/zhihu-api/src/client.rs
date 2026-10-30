@@ -17,6 +17,19 @@ pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) 
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const HOME_URL: &str = "https://www.zhihu.com/";
+const FOLLOW_RECOMMEND_URL: &str =
+    "https://api.zhihu.com/moments_v3?feed_type=recommend&include=data%5B%2A%5D.content%2Cexcerpt%2Cheadline";
+const FOLLOW_ACTIVITY_URL: &str =
+    "https://www.zhihu.com/api/v3/moments?limit=10&desktop=true&include=data%5B%2A%5D.content%2Cexcerpt%2Cheadline";
+
+/// One cursor-paginated feed page. The server-provided cursor is preferred
+/// over synthesizing page numbers: moments/topic APIs return opaque links.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedPage {
+    pub items: Vec<zhihu_types::FeedItem>,
+    pub is_end: bool,
+    pub next: Option<String>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -248,6 +261,33 @@ impl ZhihuClient {
         self.send_json(Method::GET, url, None, signed).await
     }
 
+    /// Signed raw text fetch for server-rendered fallback pages.
+    pub async fn get_text(&self, url: &str) -> Result<String> {
+        let dc0 = match self.dc0() {
+            Some(value) => value,
+            None => self.refresh_dc0()?,
+        };
+        let mut request = self
+            .http
+            .get(url)
+            .header("x-zse-93", ZHIHU_WEB_ZSE93)
+            .header("x-zse-96", sign::zse96(ZHIHU_WEB_ZSE93, url, &dc0, None))
+            .header("x-requested-with", "fetch");
+        if let Some(xsrf) = self.cookie_value("_xsrf") {
+            request = request.header("x-xsrftoken", xsrf);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(ApiError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(body)
+    }
+
     pub async fn get_json_with_referer(
         &self,
         url: &str,
@@ -336,12 +376,48 @@ impl ZhihuClient {
         Ok(crate::feed::parse_feed_page(&value))
     }
 
+    /// Follow recommendation or activity feed. `next` is the opaque cursor
+    /// returned by the previous page; `None` starts from the first page.
+    pub async fn follow_feed(
+        &self,
+        kind: zhihu_types::FollowFeedKind,
+        next: Option<&str>,
+    ) -> Result<FeedPage> {
+        let initial = match kind {
+            zhihu_types::FollowFeedKind::Recommend => FOLLOW_RECOMMEND_URL,
+            zhihu_types::FollowFeedKind::Activity => FOLLOW_ACTIVITY_URL,
+        };
+        let url = match next {
+            Some(next) if next.starts_with("https://api.zhihu.com/") => next.to_string(),
+            Some(next) if next.starts_with("https://www.zhihu.com/") => next.to_string(),
+            Some(next) if next.starts_with('/') => format!("https://www.zhihu.com{next}"),
+            _ => initial.to_string(),
+        };
+        let value = self.get_json(&url, true).await?;
+        let (items, is_end) = crate::feed::parse_feed_page(&value);
+        Ok(FeedPage {
+            items,
+            is_end,
+            next: crate::feed::parse_feed_next(&value),
+        })
+    }
+
     /// Signed full search (search_v3). Raw JSON.
     pub async fn search_json(
         &self,
         query: &str,
         offset: u32,
         options: SearchOptions,
+    ) -> Result<Value> {
+        self.search_json_scoped(query, offset, options, None).await
+    }
+
+    async fn search_json_scoped(
+        &self,
+        query: &str,
+        offset: u32,
+        options: SearchOptions,
+        restricted_member_hash: Option<&str>,
     ) -> Result<Value> {
         let mut url = Url::parse("https://www.zhihu.com/api/v4/search_v3")
             .map_err(|error| ApiError::Other(error.to_string()))?;
@@ -356,6 +432,12 @@ impl ZhihuClient {
                 .append_pair("filter_fields", "")
                 .append_pair("lc_idx", "0")
                 .append_pair("show_all_topics", "0");
+            if let Some(member_hash) = restricted_member_hash.filter(|value| !value.is_empty()) {
+                pairs
+                    .append_pair("restricted_scene", "member")
+                    .append_pair("restricted_field", "member_hash_id")
+                    .append_pair("restricted_value", member_hash);
+            }
             if let Some(vertical) = options.vertical.parameter() {
                 pairs
                     .append_pair("vertical", vertical)
@@ -366,7 +448,7 @@ impl ZhihuClient {
             }
             pairs.append_pair(
                 "search_source",
-                if options == SearchOptions::default() {
+                if options == SearchOptions::default() && restricted_member_hash.is_none() {
                     "Normal"
                 } else {
                     "Filter"
@@ -374,6 +456,19 @@ impl ZhihuClient {
             );
         }
         self.get_json(url.as_str(), true).await
+    }
+
+    pub async fn search_member(
+        &self,
+        query: &str,
+        member_hash: &str,
+        offset: u32,
+        options: SearchOptions,
+    ) -> Result<crate::feed::SearchPage> {
+        let value = self
+            .search_json_scoped(query, offset, options, Some(member_hash))
+            .await?;
+        Ok(crate::feed::parse_search_page(&value))
     }
 
     async fn login_request(
@@ -666,23 +761,66 @@ impl ZhihuClient {
 
     /// Public Zhihu Daily stories (works without login).
     pub async fn daily_latest(&self) -> Result<Vec<DailyStory>> {
+        Ok(self.daily_latest_section().await?.1)
+    }
+
+    /// Latest Daily section: `(yyyyMMdd, stories)`.
+    pub async fn daily_latest_section(&self) -> Result<(String, Vec<DailyStory>)> {
         let value = self.daily_latest_json().await?;
         let response: DailyResponse = serde_json::from_value(value)?;
-        Ok(response
-            .stories
-            .into_iter()
-            .map(|story| DailyStory {
-                id: story.id,
-                title: story.title,
-                hint: story.hint,
-                url: story.url,
-                image: story.images.into_iter().next(),
-            })
-            .collect())
+        let date = response.date;
+        Ok((
+            date.clone(),
+            response
+                .stories
+                .into_iter()
+                .map(|story| DailyStory {
+                    id: story.id,
+                    title: story.title,
+                    hint: story.hint,
+                    url: story.url,
+                    image: story.images.into_iter().next(),
+                    date: date.clone(),
+                })
+                .collect(),
+        ))
+    }
+
+    /// Daily stories before a `yyyyMMdd` date.
+    pub async fn daily_before(&self, date: &str) -> Result<(String, Vec<DailyStory>)> {
+        let primary = format!("https://news-at.zhihu.com/api/4/stories/before/{date}");
+        let value = match self.get_json(&primary, false).await {
+            Ok(value) => value,
+            Err(_) => {
+                let fallback = format!("https://daily.zhihu.com/api/4/stories/before/{date}");
+                self.get_json(&fallback, false).await?
+            }
+        };
+        let response: DailyResponse = serde_json::from_value(value)?;
+        let date = response.date;
+        Ok((
+            date.clone(),
+            response
+                .stories
+                .into_iter()
+                .map(|story| DailyStory {
+                    id: story.id,
+                    title: story.title,
+                    hint: story.hint,
+                    url: story.url,
+                    image: story.images.into_iter().next(),
+                    date: date.clone(),
+                })
+                .collect(),
+        ))
     }
 
     pub async fn me(&self) -> Result<Value> {
-        self.get_json("https://www.zhihu.com/api/v4/me", true).await
+        self.get_json(
+            "https://www.zhihu.com/api/v4/me?include=id,name,url_token,avatar_url,headline",
+            true,
+        )
+        .await
     }
 
     /// Validate the session and return the current account profile.
@@ -713,7 +851,8 @@ impl ZhihuClient {
             avatar_url: value
                 .get("avatar_url")
                 .and_then(Value::as_str)
-                .map(str::to_string),
+                .or_else(|| value.get("avatar_url_template").and_then(Value::as_str))
+                .map(|url| url.replace("{size}", "xl")),
             headline: value
                 .get("headline")
                 .and_then(Value::as_str)
@@ -742,6 +881,36 @@ impl ZhihuClient {
         Ok(crate::notifications::parse_notifications_page(&value))
     }
 
+    pub async fn notifications_unread(&self) -> Result<u64> {
+        let url = "https://api.zhihu.com/notifications/v3/message/v3?limit=1&offset=0";
+        let value = self.get_json(url, true).await?;
+        Ok(crate::notifications::parse_notifications_page(&value).total_unread)
+    }
+
+    /// Resolve a comment notification anchor to its root and the exact target.
+    pub async fn resolve_comment_anchor(
+        &self,
+        comment_id: &str,
+    ) -> Result<(zhihu_types::Comment, zhihu_types::Comment, bool)> {
+        let target_url = format!("https://www.zhihu.com/api/v4/comment_v5/comment/{comment_id}");
+        let value = self
+            .get_json_with_referer(&target_url, true, "https://www.zhihu.com/")
+            .await?;
+        let target = crate::comments::parse_comment(&value)
+            .ok_or_else(|| ApiError::Other("comment anchor is missing fields".into()))?;
+        let root_id = target.root_id.clone().filter(|id| id != comment_id);
+        let Some(root_id) = root_id else {
+            return Ok((target.clone(), target, false));
+        };
+        let root_url = format!("https://www.zhihu.com/api/v4/comment_v5/comment/{root_id}");
+        let value = self
+            .get_json_with_referer(&root_url, true, "https://www.zhihu.com/")
+            .await?;
+        let root = crate::comments::parse_comment(&value)
+            .ok_or_else(|| ApiError::Other("root comment is missing fields".into()))?;
+        Ok((root, target, true))
+    }
+
     /// Root comments for an answer/article (first page).
     pub async fn comments(
         &self,
@@ -752,20 +921,46 @@ impl ZhihuClient {
         let resource = match kind {
             zhihu_types::ContentKind::Answer => "answers",
             zhihu_types::ContentKind::Article => "articles",
-            _ => {
-                return Err(ApiError::Other(
-                    "comments are only supported for answers/articles".into(),
-                ))
-            }
+            zhihu_types::ContentKind::Pin => "pins",
+            zhihu_types::ContentKind::Question => "questions",
         };
-        let url = format!(
-            "https://www.zhihu.com/api/v4/{resource}/{id}/comments?limit=20&offset={offset}&include=content,author,reply_to_author,like_count,child_comment_count,created_time,is_author"
-        );
         let referer = match kind {
             zhihu_types::ContentKind::Answer => format!("https://www.zhihu.com/answer/{id}"),
             zhihu_types::ContentKind::Article => format!("https://zhuanlan.zhihu.com/p/{id}"),
-            _ => "https://www.zhihu.com/".to_string(),
+            zhihu_types::ContentKind::Pin => format!("https://www.zhihu.com/pin/{id}"),
+            zhihu_types::ContentKind::Question => {
+                format!("https://www.zhihu.com/question/{id}")
+            }
         };
+        // `comment_v5/.../root_comment` returns root comments only, each with its
+        // reply count and a child preview, which is what the threaded comment UI
+        // needs. The legacy `/comments` endpoint flattens replies into the same
+        // list, so it is only a fallback for accounts whose v5 page comes back
+        // empty.
+        let v5 = format!(
+            "https://www.zhihu.com/api/v4/comment_v5/{resource}/{id}/root_comment?limit=20&offset={offset}&order_by=score"
+        );
+        let legacy_fallback =
+            kind == zhihu_types::ContentKind::Answer || kind == zhihu_types::ContentKind::Article;
+        match self.get_json_with_referer(&v5, true, &referer).await {
+            Ok(value) => {
+                let mut page = crate::comments::parse_comments_page(&value);
+                if !page.items.is_empty() || !legacy_fallback {
+                    return Ok(page);
+                }
+                if offset > 0 {
+                    // A mid-pagination empty page means the thread ended; mixing in
+                    // the legacy flat list here would corrupt the thread layout.
+                    page.is_end = true;
+                    return Ok(page);
+                }
+            }
+            Err(error) if !legacy_fallback => return Err(error),
+            Err(_) => {}
+        }
+        let url = format!(
+            "https://www.zhihu.com/api/v4/{resource}/{id}/comments?limit=20&offset={offset}&include=content,author,reply_to_author,like_count,child_comment_count,created_time,is_author"
+        );
         let value = self.get_json_with_referer(&url, true, &referer).await?;
         Ok(crate::comments::parse_comments_v4_page(&value))
     }
@@ -794,13 +989,26 @@ impl ZhihuClient {
         comment_id: &str,
         offset: u32,
     ) -> Result<zhihu_types::CommentsPage> {
-        let url = format!(
-            "https://www.zhihu.com/api/v4/comments/{comment_id}/child_comments?limit=20&offset={offset}&include=content,author,reply_to_author,like_count,child_comment_count,created_time,is_author"
+        let include =
+            "content,author,reply_to_author,like_count,child_comment_count,created_time,is_author";
+        let v5 = format!(
+            "https://www.zhihu.com/api/v4/comment_v5/comment/{comment_id}/child_comment?limit=20&offset={offset}&order_by=ts&include={include}"
         );
-        let value = self
-            .get_json_with_referer(&url, true, "https://www.zhihu.com/")
-            .await?;
-        Ok(crate::comments::parse_comments_v4_page(&value))
+        match self
+            .get_json_with_referer(&v5, true, "https://www.zhihu.com/")
+            .await
+        {
+            Ok(value) => Ok(crate::comments::parse_comments_page(&value)),
+            Err(_) => {
+                let v4 = format!(
+                    "https://www.zhihu.com/api/v4/comments/{comment_id}/child_comments?limit=20&offset={offset}&include={include}"
+                );
+                let value = self
+                    .get_json_with_referer(&v4, true, "https://www.zhihu.com/")
+                    .await?;
+                Ok(crate::comments::parse_comments_v4_page(&value))
+            }
+        }
     }
 
     /// Vote an answer up/down/neutral. Returns the new vote-up count.
@@ -834,6 +1042,53 @@ impl ZhihuClient {
             .unwrap_or(0))
     }
 
+    /// Post a comment or reply on an answer/article/pin.
+    pub async fn submit_comment(
+        &self,
+        kind: zhihu_types::ContentKind,
+        id: &str,
+        text: &str,
+        reply_to_comment_id: Option<&str>,
+    ) -> Result<zhihu_types::Comment> {
+        let resource = match kind {
+            zhihu_types::ContentKind::Answer => "answers",
+            zhihu_types::ContentKind::Article => "articles",
+            zhihu_types::ContentKind::Pin => "pins",
+            zhihu_types::ContentKind::Question => "questions",
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(ApiError::Other("评论内容不能为空".into()));
+        }
+        let escaped = text
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\n', "<br>");
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "content".to_string(),
+            Value::String(format!("<p>{escaped}</p>")),
+        );
+        if let Some(reply_to) = reply_to_comment_id.filter(|id| !id.is_empty()) {
+            body.insert(
+                "reply_comment_id".to_string(),
+                Value::String(reply_to.to_string()),
+            );
+        }
+        let url = format!("https://www.zhihu.com/api/v4/comment_v5/{resource}/{id}/comment");
+        let value = self
+            .send_json(Method::POST, &url, Some(&Value::Object(body)), true)
+            .await?;
+        let comment = value
+            .get("data")
+            .or_else(|| value.get("comment"))
+            .unwrap_or(&value);
+        crate::comments::parse_comment(comment)
+            .ok_or_else(|| ApiError::Other("评论已发送，但响应缺少评论内容".into()))
+    }
+
     pub async fn like_comment(&self, id: &str, liked: bool) -> Result<()> {
         let url = format!("https://www.zhihu.com/api/v4/comments/{id}/like");
         let body = serde_json::json!({ "like": liked });
@@ -849,6 +1104,33 @@ impl ZhihuClient {
         self.send_json(method, &url, None, true).await
     }
 
+    /// Block or unblock a member on the server.
+    pub async fn block_member(&self, url_token: &str, block: bool) -> Result<()> {
+        let url = format!("https://www.zhihu.com/api/v4/members/{url_token}/actions/block");
+        let method = if block { Method::POST } else { Method::DELETE };
+        self.send_json(method, &url, None, true).await?;
+        Ok(())
+    }
+
+    /// Pin detail, including text, images and link cards.
+    pub async fn pin_detail(&self, id: &str) -> Result<zhihu_types::ContentDetail> {
+        let url = format!("https://www.zhihu.com/api/v4/pins/{id}?include=topics");
+        let value = self.get_json(&url, true).await?;
+        crate::detail::parse_pin(&value)
+            .ok_or_else(|| ApiError::Other("pin detail is missing fields".into()))
+    }
+
+    /// Like or unlike a pin. Pins expose only an up-vote action, not down-vote.
+    pub async fn vote_pin(&self, id: &str, liked: bool) -> Result<u64> {
+        let url = format!("https://www.zhihu.com/api/v4/pins/{id}/voters/up");
+        let method = if liked { Method::POST } else { Method::DELETE };
+        let value = self.send_json(method, &url, None, true).await?;
+        Ok(value
+            .get("liked_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0))
+    }
+
     /// Article detail. Requires login cookies.
     pub async fn article_detail(&self, id: &str) -> Result<zhihu_types::ContentDetail> {
         let url = format!(
@@ -857,6 +1139,42 @@ impl ZhihuClient {
         let value = self.get_json(&url, true).await?;
         crate::detail::parse_article(&value)
             .ok_or_else(|| ApiError::Other("article detail is missing fields".into()))
+    }
+
+    pub async fn topic_detail(&self, id: &str) -> Result<zhihu_types::TopicDetail> {
+        let url = format!(
+            "https://www.zhihu.com/api/v5.1/topics/{id}?include=name,excerpt,avatar_url,followers_count,questions_count,is_following,topic_id,total_pv,discuss_count"
+        );
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::topics::parse_topic_detail(&value, id))
+    }
+
+    pub async fn topic_feed(
+        &self,
+        id: &str,
+        tab: zhihu_types::TopicFeedTab,
+        sort: zhihu_types::TopicSort,
+        next: Option<&str>,
+    ) -> Result<FeedPage> {
+        let url = match next {
+            Some(next) if next.starts_with("https://www.zhihu.com/") => next.to_string(),
+            Some(next) if next.starts_with('/') => format!("https://www.zhihu.com{next}"),
+            _ => topic_feed_url(id, tab, sort),
+        };
+        let value = self.get_json(&url, true).await?;
+        let (items, is_end) = crate::feed::parse_feed_page(&value);
+        Ok(FeedPage {
+            items,
+            is_end,
+            next: crate::feed::parse_feed_next(&value),
+        })
+    }
+
+    pub async fn follow_topic(&self, id: &str, follow: bool) -> Result<()> {
+        let url = format!("https://www.zhihu.com/api/v4/topics/{id}/followers");
+        let method = if follow { Method::POST } else { Method::DELETE };
+        self.send_json(method, &url, None, true).await?;
+        Ok(())
     }
 
     pub async fn question_detail(&self, id: &str) -> Result<zhihu_types::QuestionDetail> {
@@ -890,7 +1208,7 @@ impl ZhihuClient {
 
     pub async fn member(&self, token: &str) -> Result<zhihu_types::MemberProfile> {
         let url = format!(
-            "https://www.zhihu.com/api/v4/members/{token}?include=avatar_url,headline,description,follower_count,following_count,answer_count,articles_count,is_following"
+            "https://www.zhihu.com/api/v4/members/{token}?include=avatar_url,headline,description,follower_count,following_count,answer_count,articles_count,is_following,is_blocking"
         );
         let value = self.get_json(&url, true).await?;
         crate::detail::parse_member(&value)
@@ -907,6 +1225,215 @@ impl ZhihuClient {
         );
         let value = self.get_json(&url, true).await?;
         Ok(crate::feed::parse_answers_page(&value))
+    }
+
+    /// Questions asked by a member.
+    pub async fn member_questions(
+        &self,
+        token: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::FeedItem>, bool)> {
+        let url = format!(
+            "https://www.zhihu.com/api/v4/members/{token}/questions?include=title,detail,answer_count,follower_count,author&limit=20&offset={offset}"
+        );
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::members::parse_member_questions(&value))
+    }
+
+    /// Columns a member contributes to.
+    pub async fn member_columns(
+        &self,
+        token: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::MemberColumn>, bool)> {
+        let url = format!(
+            "https://www.zhihu.com/api/v4/members/{token}/column-contributions?include=articles_count,followers,author&limit=20&offset={offset}"
+        );
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::members::parse_member_columns(&value))
+    }
+
+    pub async fn create_collection(
+        &self,
+        title: &str,
+        description: &str,
+        is_public: bool,
+    ) -> Result<zhihu_types::Collection> {
+        let url = "https://www.zhihu.com/api/v4/collections";
+        let body = serde_json::json!({
+            "title": title,
+            "description": description,
+            "is_public": is_public,
+        });
+        let value = self.send_json(Method::POST, url, Some(&body), true).await?;
+        value
+            .get("collection")
+            .and_then(crate::collections::parse_collection)
+            .ok_or_else(|| ApiError::Other("创建收藏夹返回无效".into()))
+    }
+
+    /// Collections that can contain this answer/article, with favorite state.
+    pub async fn content_collections(
+        &self,
+        kind: zhihu_types::ContentKind,
+        id: &str,
+    ) -> Result<Vec<zhihu_types::Collection>> {
+        let kind = match kind {
+            zhihu_types::ContentKind::Answer => "answer",
+            zhihu_types::ContentKind::Article => "article",
+            _ => return Err(ApiError::Other("该内容暂不支持收藏".into())),
+        };
+        let url = format!("https://api.zhihu.com/collections/contents/{kind}/{id}?limit=50");
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::collections::parse_collections(&value))
+    }
+
+    pub async fn collections(
+        &self,
+        token: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::Collection>, bool)> {
+        let url = format!(
+            "https://www.zhihu.com/api/v4/people/{token}/collections?offset={offset}&limit=20"
+        );
+        let value = self.get_json(&url, true).await?;
+        let items = crate::collections::parse_collections(&value);
+        let is_end = value
+            .get("paging")
+            .and_then(|paging| paging.get("is_end"))
+            .and_then(Value::as_bool)
+            .unwrap_or(items.len() < 20);
+        Ok((items, is_end))
+    }
+
+    pub async fn collection_items(
+        &self,
+        id: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::FeedItem>, bool)> {
+        let url =
+            format!("https://www.zhihu.com/api/v4/collections/{id}/items?offset={offset}&limit=20");
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::collections::parse_collection_items(&value))
+    }
+
+    pub async fn collection_detail(&self, id: &str) -> Result<zhihu_types::Collection> {
+        let url = format!("https://www.zhihu.com/api/v4/collections/{id}");
+        let value = self.get_json(&url, true).await?;
+        value
+            .get("collection")
+            .and_then(crate::collections::parse_collection)
+            .ok_or_else(|| ApiError::Other("collection detail is missing fields".into()))
+    }
+
+    pub async fn set_favorite(
+        &self,
+        kind: zhihu_types::ContentKind,
+        id: &str,
+        collection_id: &str,
+        favorite: bool,
+    ) -> Result<()> {
+        let kind = match kind {
+            zhihu_types::ContentKind::Answer => "answer",
+            zhihu_types::ContentKind::Article => "article",
+            _ => return Err(ApiError::Other("该内容暂不支持收藏".into())),
+        };
+        let action = if favorite { "add" } else { "remove" };
+        let body = format!("{action}_collections={collection_id}");
+        let response = self
+            .http
+            .put(format!(
+                "https://api.zhihu.com/collections/contents/{kind}/{id}"
+            ))
+            .header(REFERER, HOME_URL)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::Status {
+                status: status.as_u16(),
+                body: response.text().await.unwrap_or_default(),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn member_articles(
+        &self,
+        token: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::FeedItem>, bool)> {
+        let url = format!(
+            "https://www.zhihu.com/api/v4/members/{token}/articles?include=content,excerpt,author,comment_count,voteup_count,created,updated&limit=20&offset={offset}&sort_by=created"
+        );
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::feed::parse_answers_page(&value))
+    }
+
+    pub async fn member_pins(
+        &self,
+        token: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::FeedItem>, bool)> {
+        let url = format!(
+            "https://www.zhihu.com/api/v4/v2/pins/{token}/moments?include=like_count,comment_count,created,updated,content&limit=20&offset={offset}"
+        );
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::members::parse_member_pins(&value))
+    }
+
+    pub async fn member_activities(
+        &self,
+        token: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::FeedItem>, bool)> {
+        let url = format!(
+            "https://www.zhihu.com/api/v3/moments/{token}/activities?limit=20&offset={offset}"
+        );
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::feed::parse_feed_page(&value))
+    }
+
+    pub async fn member_favlists(
+        &self,
+        token: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::Collection>, bool)> {
+        let url = format!(
+            "https://www.zhihu.com/api/v4/members/{token}/favlists?limit=20&offset={offset}"
+        );
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::members::parse_member_favlists(&value))
+    }
+
+    pub async fn member_followers(
+        &self,
+        token: &str,
+        member_id: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::MemberProfile>, bool)> {
+        let id = if member_id.is_empty() {
+            token
+        } else {
+            member_id
+        };
+        let url = format!("https://api.zhihu.com/people/{id}/followers?limit=20&offset={offset}");
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::members::parse_member_people(&value))
+    }
+
+    pub async fn member_followees(
+        &self,
+        token: &str,
+        offset: u32,
+    ) -> Result<(Vec<zhihu_types::MemberProfile>, bool)> {
+        let url = format!(
+            "https://www.zhihu.com/api/v4/members/{token}/followees?limit=20&offset={offset}"
+        );
+        let value = self.get_json(&url, true).await?;
+        Ok(crate::members::parse_member_people(&value))
     }
 
     /// Search questions only; used to jump from a hot query to a question page.
@@ -950,6 +1477,8 @@ struct HotQuery {
 #[derive(Debug, Deserialize)]
 struct DailyResponse {
     #[serde(default)]
+    date: String,
+    #[serde(default)]
     stories: Vec<DailyStoryDto>,
 }
 
@@ -964,6 +1493,31 @@ struct DailyStoryDto {
     url: String,
     #[serde(default)]
     images: Vec<String>,
+}
+
+fn topic_feed_url(
+    id: &str,
+    tab: zhihu_types::TopicFeedTab,
+    sort: zhihu_types::TopicSort,
+) -> String {
+    let endpoint = match (tab, sort) {
+        (zhihu_types::TopicFeedTab::Discussion, zhihu_types::TopicSort::Essence) => {
+            "top_activity/v2"
+        }
+        (zhihu_types::TopicFeedTab::Discussion, zhihu_types::TopicSort::Hot) => "essence/v2",
+        (zhihu_types::TopicFeedTab::Discussion, zhihu_types::TopicSort::Latest) => {
+            "timeline_activity/v2"
+        }
+        (zhihu_types::TopicFeedTab::Ideas, zhihu_types::TopicSort::Latest) => "pin-new",
+        (zhihu_types::TopicFeedTab::Ideas, _) => "pin-hot",
+        (zhihu_types::TopicFeedTab::Unanswered, _) => "top_question/v2",
+    };
+    let limit = if tab == zhihu_types::TopicFeedTab::Ideas {
+        "limit=10"
+    } else {
+        "limit=20"
+    };
+    format!("https://www.zhihu.com/api/v5.1/topics/{id}/feeds/{endpoint}?offset=0&{limit}")
 }
 
 /// Zhihu's web client uses a device cookie shaped like
@@ -988,4 +1542,32 @@ fn synthetic_dc0() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("A{opaque}|{millis}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zhihu_types::{TopicFeedTab, TopicSort};
+
+    #[test]
+    fn builds_topic_feed_endpoints() {
+        assert!(
+            topic_feed_url("1", TopicFeedTab::Discussion, TopicSort::Hot)
+                .contains("/feeds/essence/v2?")
+        );
+        assert!(
+            topic_feed_url("1", TopicFeedTab::Discussion, TopicSort::Latest)
+                .contains("/feeds/timeline_activity/v2?")
+        );
+        assert!(
+            topic_feed_url("1", TopicFeedTab::Ideas, TopicSort::Latest).contains("/feeds/pin-new?")
+        );
+        assert!(
+            topic_feed_url("1", TopicFeedTab::Ideas, TopicSort::Hot).contains("/feeds/pin-hot?")
+        );
+        assert!(
+            topic_feed_url("1", TopicFeedTab::Unanswered, TopicSort::Hot)
+                .contains("/feeds/top_question/v2?")
+        );
+    }
 }

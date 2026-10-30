@@ -53,10 +53,19 @@ fn author_of(value: &Value) -> Author {
                 author.and_then(|a| string_at(a, &["avatar_url_template", "avatarUrlTemplate"]))
             })
             .map(|url| url.replace("{size}", "xl")),
+        is_mcn: value.get("author").is_some_and(crate::feed::is_mcn_author),
     }
 }
 
 fn vote_state_of(value: &Value) -> String {
+    if value
+        .get("virtuals")
+        .and_then(|virtuals| virtuals.get("is_liked").or_else(|| virtuals.get("isLiked")))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "up".to_string();
+    }
     value
         .get("reaction")
         .and_then(|reaction| reaction.get("relation"))
@@ -121,6 +130,70 @@ pub fn parse_article(value: &Value) -> Option<ContentDetail> {
     })
 }
 
+/// Convert the rich-text array returned by `/api/v4/pins/{id}` into the HTML
+/// subset consumed by the shared content pipeline. Text-only pins are escaped
+/// as well: their content is data, never trusted markup.
+pub fn pin_content_html(value: &Value) -> String {
+    fn escape_html(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+    if let Some(html) = string_at(value, &["content_html", "contentHtml"]) {
+        return html.to_string();
+    }
+    if let Some(text) = string_at(value, &["content"]) {
+        return format!("<p>{}</p>", escape_html(text));
+    }
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            Some(match string_at(block, &["type"]) {
+                Some("image") => {
+                    let url = string_at(block, &["original_url", "url"])?;
+                    format!("<figure><img src=\"{}\" /></figure>", escape_html(url))
+                }
+                Some("link" | "link_card") => {
+                    let url = string_at(block, &["url"])?;
+                    let label = string_at(block, &["content", "text", "title"]).unwrap_or(url);
+                    format!("<p><a href=\"{}\">{}</a></p>", escape_html(url), label)
+                }
+                _ => {
+                    let html = string_at(block, &["content", "text"])?;
+                    format!("<p>{html}</p>")
+                }
+            })
+        })
+        .collect()
+}
+
+pub fn parse_pin(value: &Value) -> Option<ContentDetail> {
+    let content_html = pin_content_html(value);
+    Some(ContentDetail {
+        id: id_of(value)?,
+        title: string_at(value, &["title", "excerpt_title"])
+            .filter(|title| !title.is_empty())
+            .unwrap_or("想法")
+            .to_string(),
+        author: author_of(value),
+        kind: ContentKind::Pin,
+        content_html,
+        excerpt: string_at(value, &["excerpt", "excerpt_title"])
+            .unwrap_or_default()
+            .to_string(),
+        vote_up_count: number_at(value, &["voteup_count", "like_count", "voteupCount"]),
+        comment_count: number_at(value, &["comment_count", "commentCount"]),
+        vote_state: vote_state_of(value),
+        created_time: number_at(value, &["created_time", "created"]) as i64,
+        updated_time: number_at(value, &["updated_time", "updated"]) as i64,
+        question_id: None,
+    })
+}
+
 pub fn parse_question(value: &Value) -> Option<QuestionDetail> {
     Some(QuestionDetail {
         id: id_of(value)?,
@@ -157,6 +230,12 @@ pub fn parse_member(value: &Value) -> Option<MemberProfile> {
             .get("is_following")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        is_blocking: value
+            .get("is_blocking")
+            .or_else(|| value.get("is_blocked"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        is_mcn: crate::feed::is_mcn_author(value),
     })
 }
 
@@ -164,6 +243,43 @@ pub fn parse_member(value: &Value) -> Option<MemberProfile> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parses_pin_content_and_like_state() {
+        let value = json!({
+            "id": 101,
+            "excerpt_title": "想法标题",
+            "content": [
+                { "type": "text", "content": "这是 <b>想法</b>。", "title": "想法标题" },
+                { "type": "image", "url": "https://picx.zhimg.com/pin.jpg", "original_url": "https://picx.zhimg.com/original.jpg" },
+                { "type": "link_card", "url": "https://www.zhihu.com/question/42" }
+            ],
+            "like_count": 9,
+            "comment_count": 3,
+            "created": 1713456789,
+            "updated": 1713456790,
+            "virtuals": { "is_liked": true },
+            "author": { "id": "u1", "name": "alice", "url_token": "alice" }
+        });
+        let detail = parse_pin(&value).unwrap();
+        assert_eq!(detail.kind, ContentKind::Pin);
+        assert_eq!(detail.title, "想法标题");
+        assert_eq!(detail.vote_up_count, 9);
+        assert_eq!(detail.vote_state, "up");
+        assert!(detail.content_html.contains("<b>想法</b>"));
+        assert!(detail.content_html.contains("original.jpg"));
+        assert!(detail.content_html.contains("question/42"));
+    }
+
+    #[test]
+    fn pin_content_html_escapes_text_and_supports_legacy_html() {
+        let html = pin_content_html(&json!({ "content": "<script>alert(1)</script>" }));
+        assert_eq!(html, "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>");
+        assert_eq!(
+            pin_content_html(&json!({ "content_html": "<p>safe</p>" })),
+            "<p>safe</p>"
+        );
+    }
 
     #[test]
     fn parses_answer() {

@@ -5,5 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = ["onnx"]
+# Local ONNX runtime + bundled bge-small-zh embeddings. Disable to build a
+# statistics-only binary (hash-bigram provider).
+onnx = ["dep:ort", "dep:tokenizers"]
+
 [dependencies]
 zhihu-types = { path = "../zhihu-types" }
+ort = { version = "2.0.0-rc.15", optional = true }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"], optional = true }

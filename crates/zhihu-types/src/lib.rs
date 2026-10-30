@@ -17,6 +17,8 @@ pub struct Author {
     pub is_following: bool,
     #[serde(default)]
     pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub is_mcn: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +38,26 @@ impl ContentKind {
             ContentKind::Question => "问题",
         }
     }
+
+    /// Stable lowercase key used by the local SQLite store.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentKind::Answer => "answer",
+            ContentKind::Article => "article",
+            ContentKind::Pin => "pin",
+            ContentKind::Question => "question",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "answer" => Some(ContentKind::Answer),
+            "article" => Some(ContentKind::Article),
+            "pin" => Some(ContentKind::Pin),
+            "question" => Some(ContentKind::Question),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +75,8 @@ pub struct DailyStory {
     pub hint: String,
     pub url: String,
     pub image: Option<String>,
+    #[serde(default)]
+    pub date: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +120,108 @@ pub struct ContentDetail {
     pub question_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FollowFeedKind {
+    #[default]
+    Recommend,
+    Activity,
+}
+
+impl FollowFeedKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recommend => "推荐",
+            Self::Activity => "动态",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Collection {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub item_count: u64,
+    #[serde(default)]
+    pub is_public: bool,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub is_favorited: bool,
+}
+
+/// A Zhihu column (`members/{token}/column-contributions`).
+///
+/// There is no in-app column page yet; the profile tab lists columns and opens
+/// them in the browser, matching the reference client.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberColumn {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub article_count: u64,
+    #[serde(default)]
+    pub follower_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicDetail {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub excerpt: String,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub followers_count: u64,
+    #[serde(default)]
+    pub questions_count: u64,
+    #[serde(default)]
+    pub discuss_count: u64,
+    #[serde(default)]
+    pub is_following: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TopicFeedTab {
+    #[default]
+    Discussion,
+    Ideas,
+    Unanswered,
+}
+
+impl TopicFeedTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Discussion => "讨论",
+            Self::Ideas => "想法",
+            Self::Unanswered => "待回答",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TopicSort {
+    #[default]
+    Essence,
+    Hot,
+    Latest,
+}
+
+impl TopicSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Essence => "精华",
+            Self::Hot => "最热",
+            Self::Latest => "最新",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionDetail {
     pub id: String,
@@ -122,6 +248,10 @@ pub struct Comment {
     pub child_count: u64,
     pub created_time: i64,
     pub is_author: bool,
+    #[serde(default)]
+    pub is_mine: bool,
+    #[serde(default)]
+    pub root_id: Option<String>,
     #[serde(default)]
     pub children: Vec<Comment>,
     #[serde(default)]
@@ -157,6 +287,18 @@ pub struct MemberProfile {
     pub answer_count: u64,
     pub articles_count: u64,
     pub is_following: bool,
+    #[serde(default)]
+    pub is_blocking: bool,
+    #[serde(default)]
+    pub is_mcn: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentAnchor {
+    pub kind: ContentKind,
+    pub content_id: String,
+    pub comment_id: String,
+    pub is_child: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +313,101 @@ pub struct NotificationEntry {
     pub actor_avatar: Option<String>,
     pub created: i64,
     pub is_read: bool,
+    #[serde(default)]
+    pub target_link: Option<String>,
+    #[serde(default)]
+    pub target_url: Option<String>,
+}
+
+impl NotificationEntry {
+    /// Parse the official `zhihu://comment/list/...` target used by reply and
+    /// comment-like notifications.
+    pub fn comment_anchor(&self) -> Option<CommentAnchor> {
+        let link = self.target_link.as_deref()?;
+        parse_comment_anchor(link)
+    }
+
+    pub fn content_target(&self) -> Option<(ContentKind, String)> {
+        parse_content_link(self.target_url.as_deref()?)
+            .or_else(|| parse_content_link(self.target_link.as_deref()?))
+    }
+}
+
+pub fn parse_comment_anchor(link: &str) -> Option<CommentAnchor> {
+    let rest = link
+        .strip_prefix("zhihu://comment/list/")
+        .or_else(|| link.split("/comment/list/").nth(1))?;
+    let (path, query_string) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut parts = path.split('/');
+    let kind = match parts.next()? {
+        "answer" => ContentKind::Answer,
+        "article" => ContentKind::Article,
+        "pin" => ContentKind::Pin,
+        "question" => ContentKind::Question,
+        _ => return None,
+    };
+    let content_id = parts.next()?.trim().to_string();
+    if content_id.is_empty() {
+        return None;
+    }
+    let mut comment_id = None;
+    let mut is_child = false;
+    for pair in query_string.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        match key {
+            "anchor_comment_id" => comment_id = Some(value.to_string()),
+            "is_child" => is_child = value == "true" || value == "1",
+            _ => {}
+        }
+    }
+    Some(CommentAnchor {
+        kind,
+        content_id,
+        comment_id: comment_id?,
+        is_child,
+    })
+}
+
+fn parse_content_link(link: &str) -> Option<(ContentKind, String)> {
+    if let Some(rest) = link.split("/answer/").nth(1) {
+        let id = rest.split(['?', '#', '/']).next()?.trim();
+        return (!id.is_empty()).then(|| (ContentKind::Answer, id.to_string()));
+    }
+    if let Some(rest) = link.split("zhuanlan.zhihu.com/p/").nth(1) {
+        let id = rest.split(['?', '#', '/']).next()?.trim();
+        return (!id.is_empty()).then(|| (ContentKind::Article, id.to_string()));
+    }
+    if let Some(rest) = link.split("/pin/").nth(1) {
+        let id = rest.split(['?', '#', '/']).next()?.trim();
+        return (!id.is_empty()).then(|| (ContentKind::Pin, id.to_string()));
+    }
+    if let Some(rest) = link.split("/question/").nth(1) {
+        let id = rest.split(['?', '#', '/']).next()?.trim();
+        return (!id.is_empty()).then(|| (ContentKind::Question, id.to_string()));
+    }
+    None
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Highlight {
+    pub id: i64,
+    /// `answer`, `article`, `pin` or `question`.
+    pub target_type: String,
+    pub target_id: String,
+    pub title: String,
+    pub quote: String,
+    pub note: String,
+    pub tags: String,
+    pub color: String,
+    pub start_offset: i64,
+    pub end_offset: i64,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicRef {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,8 +419,14 @@ pub struct FeedItem {
     pub kind: ContentKind,
     pub vote_up_count: u64,
     pub comment_count: u64,
+    /// Publish time (unix seconds) as reported by the server; 0 when the
+    /// source does not provide one.
+    #[serde(default)]
+    pub created_at: i64,
     #[serde(default)]
     pub topics: Vec<String>,
+    #[serde(default)]
+    pub topic_refs: Vec<TopicRef>,
 }
 
 /// Placeholder dataset used by the M0 smoke screen.
@@ -287,6 +530,12 @@ pub fn m0_sample_feed() -> Vec<FeedItem> {
         ),
     ];
 
+    // Sample items get synthetic publish times a few hours apart so the
+    // Android timeline has something meaningful to show.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
     TITLES
         .iter()
         .enumerate()
@@ -302,12 +551,46 @@ pub fn m0_sample_feed() -> Vec<FeedItem> {
                     url_token: None,
                     is_following: false,
                     avatar_url: None,
+                    is_mcn: false,
                 },
                 kind: *kind,
                 vote_up_count: *votes,
                 comment_count: *comments,
+                created_at: now - (i as i64) * 3 * 3_600 - 900,
                 topics: Vec::new(),
+                topic_refs: Vec::new(),
             },
         )
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_comment_notification_anchor() {
+        let anchor =
+            parse_comment_anchor("zhihu://comment/list/answer/2?anchor_comment_id=3&is_child=true")
+                .unwrap();
+        assert_eq!(anchor.kind, ContentKind::Answer);
+        assert_eq!(anchor.content_id, "2");
+        assert_eq!(anchor.comment_id, "3");
+        assert!(anchor.is_child);
+
+        assert!(parse_comment_anchor("zhihu://comment/list/answer/2").is_none());
+        assert!(parse_comment_anchor("https://www.zhihu.com/people/x").is_none());
+    }
+
+    #[test]
+    fn resolves_notification_content_target() {
+        assert_eq!(
+            parse_content_link("https://www.zhihu.com/question/1/answer/2"),
+            Some((ContentKind::Answer, "2".to_string()))
+        );
+        assert_eq!(
+            parse_content_link("https://www.zhihu.com/pin/9"),
+            Some((ContentKind::Pin, "9".to_string()))
+        );
+    }
 }

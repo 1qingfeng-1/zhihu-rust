@@ -14,8 +14,33 @@ fn number_at(value: &Value, keys: &[&str]) -> u64 {
         .unwrap_or(0)
 }
 
-fn author_of(value: &Value) -> Author {
+fn contains_mcn(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.to_ascii_lowercase().contains("mcn"),
+        Value::Array(items) => items.iter().any(contains_mcn),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| key.to_ascii_lowercase().contains("mcn") || contains_mcn(item)),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_mcn_author(value: &Value) -> bool {
+    value
+        .get("is_mcn")
+        .or_else(|| value.get("isMcn"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value.get("mcn_info").is_some_and(|info| !info.is_null())
+        || ["badge_v2", "badgeV2", "badge"]
+            .iter()
+            .filter_map(|key| value.get(*key))
+            .any(contains_mcn)
+}
+
+pub(crate) fn author_of(value: &Value) -> Author {
     let author = value.get("author");
+    let author_value = author.unwrap_or(&Value::Null);
     Author {
         id: author
             .and_then(|author| author.get("id"))
@@ -47,18 +72,39 @@ fn author_of(value: &Value) -> Author {
                 })
             })
             .map(|url| url.replace("{size}", "xl")),
+        is_mcn: is_mcn_author(author_value),
     }
 }
 
 fn topics_of(target: &Value) -> Vec<String> {
+    topic_refs_of(target)
+        .into_iter()
+        .map(|topic| topic.name)
+        .collect()
+}
+
+fn topic_refs_of(target: &Value) -> Vec<zhihu_types::TopicRef> {
     target
         .get("topics")
         .or_else(|| target.get("question").and_then(|q| q.get("topics")))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|topic| topic.get("name").and_then(Value::as_str))
-        .map(str::to_string)
+        .filter_map(|topic| {
+            let name = topic.get("name").and_then(Value::as_str)?;
+            let id = topic
+                .get("id")
+                .and_then(|id| {
+                    id.as_i64()
+                        .map(|n| n.to_string())
+                        .or_else(|| id.as_str().map(str::to_string))
+                })
+                .unwrap_or_default();
+            Some(zhihu_types::TopicRef {
+                id,
+                name: name.to_string(),
+            })
+        })
         .collect()
 }
 
@@ -69,7 +115,7 @@ fn target_type(target: &Value) -> Option<&str> {
 /// Strip search highlight tags and decode the entities Zhihu emits in
 /// excerpts. Search results wrap matches in `<em>...</em>` and may include
 /// `<br>` between paragraphs.
-fn clean_text(value: &str) -> String {
+pub(crate) fn clean_text(value: &str) -> String {
     let value = value
         .replace("<br>", " ")
         .replace("<br/>", " ")
@@ -122,6 +168,16 @@ pub fn parse_feed_page(value: &Value) -> (Vec<FeedItem>, bool) {
         .and_then(Value::as_bool)
         .unwrap_or(items.len() < 10);
     (items, is_end)
+}
+
+/// Next-page URL for APIs that use a server-provided cursor.
+pub fn parse_feed_next(value: &Value) -> Option<String> {
+    value
+        .get("paging")
+        .and_then(|paging| paging.get("next"))
+        .and_then(Value::as_str)
+        .filter(|next| !next.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse a question answer page. The `data` array contains answer objects
@@ -222,7 +278,18 @@ pub fn parse_target(target: &Value) -> Option<FeedItem> {
             &["voteup_count", "voteupCount", "like_count", "vote_count"],
         ),
         comment_count: number_at(target, &["comment_count", "commentCount"]),
+        created_at: number_at(
+            target,
+            &[
+                "created_time",
+                "created",
+                "createdTime",
+                "updated_time",
+                "updated",
+            ],
+        ) as i64,
         topics: topics_of(target),
+        topic_refs: topic_refs_of(target),
     })
 }
 
@@ -274,6 +341,28 @@ mod tests {
 
         // No paging object: short pages are treated as the end.
         assert!(parse_feed_page(&json!({ "data": [] })).1);
+    }
+
+    #[test]
+    fn detects_explicit_mcn_authors() {
+        assert!(is_mcn_author(&json!({ "is_mcn": true })));
+        assert!(is_mcn_author(&json!({
+            "badge_v2": { "detail_badges": [{ "title": "所属 MCN 机构" }] }
+        })));
+        assert!(!is_mcn_author(&json!({ "name": "普通用户" })));
+    }
+
+    #[test]
+    fn parses_feed_next_cursor() {
+        let value = json!({
+            "data": [],
+            "paging": { "is_end": false, "next": "https://api.zhihu.com/moments_v3?offset=10" }
+        });
+        assert_eq!(
+            parse_feed_next(&value).as_deref(),
+            Some("https://api.zhihu.com/moments_v3?offset=10")
+        );
+        assert_eq!(parse_feed_next(&json!({ "data": [] })), None);
     }
 
     #[test]

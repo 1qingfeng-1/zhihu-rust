@@ -5,13 +5,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use gpui_kit::base::SelectableText;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, font, img, px, AnyElement, App, Font, Hsla, RenderImage, Rgba, SharedString, StyledText,
-    TextRun, UnderlineStyle, Window,
+    div, font, img, px, AnyElement, App, Font, FontStyle, FontWeight, Hsla, RenderImage, Rgba,
+    SharedString, StyledText, TextRun, TextStyleRefinement, UnderlineStyle, Window,
 };
 use zhihu_content::{Block, Inline};
 
+use crate::selectable;
 use crate::typography::Typography;
 use crate::{MONO_FONT, UI_FONT};
 
@@ -23,6 +25,16 @@ pub type ImageClickHandler = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + 'stati
 
 /// Callback used by code/formula copy buttons.
 pub type CopyHandler = Arc<dyn Fn(String, &mut Window, &mut App) + 'static>;
+
+/// Callback used by inline hyperlinks.
+pub(crate) type LinkClickHandler = Arc<dyn Fn(String, &mut Window, &mut App) + 'static>;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadingEnhancements {
+    pub first_line_indent: bool,
+    pub pos_colors: bool,
+    pub dark: bool,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_blocks(
@@ -38,6 +50,52 @@ pub fn render_blocks(
     video_click: Option<&VideoClickHandler>,
     image_click: Option<&ImageClickHandler>,
     copy: Option<&CopyHandler>,
+    link_click: Option<&LinkClickHandler>,
+    selectable: bool,
+    highlight: Option<(&str, Rgba)>,
+    enhancements: ReadingEnhancements,
+) -> Vec<AnyElement> {
+    let order = std::cell::Cell::new(0u64);
+    render_blocks_with_order(
+        blocks,
+        fg,
+        muted,
+        accent,
+        surface,
+        border,
+        typography,
+        images,
+        image_errors,
+        video_click,
+        image_click,
+        copy,
+        link_click,
+        selectable,
+        &order,
+        highlight,
+        enhancements,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_blocks_with_order(
+    blocks: &[Block],
+    fg: Rgba,
+    muted: Rgba,
+    accent: Rgba,
+    surface: Rgba,
+    border: Rgba,
+    typography: &Typography,
+    images: &HashMap<String, PathBuf>,
+    image_errors: &HashSet<String>,
+    video_click: Option<&VideoClickHandler>,
+    image_click: Option<&ImageClickHandler>,
+    copy: Option<&CopyHandler>,
+    link_click: Option<&LinkClickHandler>,
+    selectable: bool,
+    order: &std::cell::Cell<u64>,
+    highlight: Option<(&str, Rgba)>,
+    enhancements: ReadingEnhancements,
 ) -> Vec<AnyElement> {
     blocks
         .iter()
@@ -81,20 +139,81 @@ pub fn render_blocks(
                         return row.into_any_element();
                     }
                 }
+                let has_emoji = inlines.iter().any(|inline| match inline {
+                    Inline::Text { text, .. } => crate::emoji::has_emoji(text),
+                    _ => false,
+                });
+                let rich = selectable && !has_emoji;
+                let needs_flow = enhancements.first_line_indent
+                    || enhancements.pos_colors
+                    || inlines.iter().any(|inline| match inline {
+                        Inline::Text { text, link, .. } => {
+                            link.is_some() || crate::emoji::has_emoji(text)
+                        }
+                        _ => false,
+                    });
                 div()
                     .w_full()
                     .text_size(px(typography.body_size))
                     .line_height(px(typography.line_height))
-                    .child(styled_inlines(
-                        inlines,
-                        fg,
-                        muted,
-                        accent,
-                        border,
-                        false,
-                        false,
-                        typography.link_underline,
-                    ))
+                    .child(if rich {
+                        let index = order.get();
+                        order.set(index + 1);
+                        let content = selectable::build(
+                            inlines,
+                            fg,
+                            muted,
+                            accent,
+                            surface,
+                            enhancements.pos_colors,
+                            enhancements.dark,
+                            enhancements.first_line_indent,
+                            false,
+                            highlight,
+                        );
+                        selectable::SelectableRichText::new(
+                            SharedString::from(format!("rich-{index}")),
+                            content,
+                            index,
+                        )
+                        .text_style(selectable_text_style(
+                            fg,
+                            typography.body_size,
+                            typography.line_height,
+                            false,
+                            false,
+                            false,
+                            false,
+                        ))
+                        .link_click(link_click.cloned())
+                        .into_any_element()
+                    } else if needs_flow {
+                        inline_flow(
+                            inlines,
+                            fg,
+                            muted,
+                            accent,
+                            surface,
+                            typography,
+                            link_click,
+                            selectable,
+                            order,
+                            enhancements.first_line_indent,
+                            enhancements,
+                        )
+                    } else {
+                        styled_inlines(
+                            inlines,
+                            fg,
+                            muted,
+                            accent,
+                            border,
+                            false,
+                            false,
+                            typography.link_underline,
+                        )
+                        .into_any_element()
+                    })
                     .into_any_element()
             }
             Block::Heading { level, content } => {
@@ -105,20 +224,54 @@ pub fn render_blocks(
                     .mb(px(typography.block_gap * 0.15))
                     .text_size(px(size))
                     .line_height(px(typography.heading_line_height(*level)))
-                    .child(styled_inlines(
-                        content,
-                        fg,
-                        muted,
-                        accent,
-                        border,
-                        true,
-                        false,
-                        typography.link_underline,
-                    ))
+                    .child(if selectable {
+                        let index = order.get();
+                        order.set(index + 1);
+                        let content = selectable::build(
+                            content,
+                            fg,
+                            muted,
+                            accent,
+                            surface,
+                            enhancements.pos_colors,
+                            enhancements.dark,
+                            false,
+                            true,
+                            highlight,
+                        );
+                        selectable::SelectableRichText::new(
+                            SharedString::from(format!("rich-{index}")),
+                            content,
+                            index,
+                        )
+                        .text_style(selectable_text_style(
+                            fg,
+                            size,
+                            typography.heading_line_height(*level),
+                            false,
+                            true,
+                            false,
+                            false,
+                        ))
+                        .link_click(link_click.cloned())
+                        .into_any_element()
+                    } else {
+                        styled_inlines(
+                            content,
+                            fg,
+                            muted,
+                            accent,
+                            border,
+                            true,
+                            false,
+                            typography.link_underline,
+                        )
+                        .into_any_element()
+                    })
                     .into_any_element()
             }
             Block::Quote(inner) => {
-                let children = render_blocks(
+                let children = render_blocks_with_order(
                     inner,
                     muted,
                     muted,
@@ -131,6 +284,11 @@ pub fn render_blocks(
                     video_click,
                     image_click,
                     copy,
+                    link_click,
+                    selectable,
+                    order,
+                    highlight,
+                    enhancements,
                 );
                 div()
                     .w_full()
@@ -178,16 +336,80 @@ pub fn render_blocks(
                                     .min_w_0()
                                     .text_size(px(typography.body_size))
                                     .line_height(px(typography.line_height))
-                                    .child(styled_inlines(
-                                        item,
-                                        fg,
-                                        muted,
-                                        accent,
-                                        border,
-                                        false,
-                                        false,
-                                        typography.link_underline,
-                                    )),
+                                    .child({
+                                        let has_emoji = item.iter().any(|inline| match inline {
+                                            Inline::Text { text, .. } => {
+                                                crate::emoji::has_emoji(text)
+                                            }
+                                            _ => false,
+                                        });
+                                        let needs_flow = has_emoji
+                                            || enhancements.pos_colors
+                                            || item.iter().any(|inline| match inline {
+                                                Inline::Text { text, link, .. } => {
+                                                    link.is_some() || crate::emoji::has_emoji(text)
+                                                }
+                                                _ => false,
+                                            });
+                                        if selectable && !has_emoji {
+                                            let index = order.get();
+                                            order.set(index + 1);
+                                            let content = selectable::build(
+                                                item,
+                                                fg,
+                                                muted,
+                                                accent,
+                                                surface,
+                                                enhancements.pos_colors,
+                                                enhancements.dark,
+                                                false,
+                                                false,
+                                                highlight,
+                                            );
+                                            selectable::SelectableRichText::new(
+                                                SharedString::from(format!("rich-{index}")),
+                                                content,
+                                                index,
+                                            )
+                                            .text_style(selectable_text_style(
+                                                fg,
+                                                typography.body_size,
+                                                typography.line_height,
+                                                false,
+                                                false,
+                                                false,
+                                                false,
+                                            ))
+                                            .link_click(link_click.cloned())
+                                            .into_any_element()
+                                        } else if needs_flow {
+                                            inline_flow(
+                                                item,
+                                                fg,
+                                                muted,
+                                                accent,
+                                                surface,
+                                                typography,
+                                                link_click,
+                                                selectable,
+                                                order,
+                                                false,
+                                                enhancements,
+                                            )
+                                        } else {
+                                            styled_inlines(
+                                                item,
+                                                fg,
+                                                muted,
+                                                accent,
+                                                border,
+                                                false,
+                                                false,
+                                                typography.link_underline,
+                                            )
+                                            .into_any_element()
+                                        }
+                                    }),
                             ),
                     );
                 }
@@ -245,9 +467,17 @@ pub fn render_blocks(
             }
             Block::Image { src, alt } => {
                 let body: AnyElement = if let Some(path) = images.get(src) {
-                    let picture = img(path.clone())
+                    let picture = div()
                         .w_full()
-                        .max_h(px(320.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            img(path.clone())
+                                .max_w_full()
+                                .max_h(px(320.))
+                                .object_fit(gpui_kit::ObjectFit::Contain),
+                        )
                         .into_any_element();
                     if let Some(click) = image_click {
                         let click = click.clone();
@@ -437,6 +667,244 @@ fn render_formula(tex: &str, font_size: f32, color: Rgba) -> Option<FormulaImage
         cache.insert(key, value.clone());
         value
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_flow(
+    inlines: &[Inline],
+    fg: Rgba,
+    muted: Rgba,
+    accent: Rgba,
+    surface: Rgba,
+    typography: &Typography,
+    link_click: Option<&LinkClickHandler>,
+    selectable: bool,
+    order: &std::cell::Cell<u64>,
+    first_line_indent: bool,
+    enhancements: ReadingEnhancements,
+) -> AnyElement {
+    let mut row = div().w_full().flex().flex_wrap().items_center();
+    if first_line_indent {
+        row = row.child(
+            div()
+                .text_size(px(typography.body_size))
+                .line_height(px(typography.line_height))
+                .text_color(fg)
+                .child("　　"),
+        );
+    }
+    let mut sequence = 0usize;
+    for inline in inlines {
+        match inline {
+            Inline::Text {
+                text,
+                bold,
+                italic,
+                code,
+                link,
+            } => {
+                for piece in crate::emoji::pieces(text) {
+                    match piece {
+                        crate::emoji::EmojiPiece::Text(value) => {
+                            let chunks: Vec<(String, crate::pos::WordClass)> =
+                                if enhancements.pos_colors && link.is_none() && !*code {
+                                    crate::pos::segments(&value)
+                                        .into_iter()
+                                        .map(|part| (part.text, part.class))
+                                        .collect()
+                                } else {
+                                    text_chunks(&value)
+                                        .into_iter()
+                                        .map(|chunk| {
+                                            (chunk.to_string(), crate::pos::WordClass::Plain)
+                                        })
+                                        .collect()
+                                };
+                            for (chunk, class) in chunks {
+                                let color = if link.is_some() || *code {
+                                    accent
+                                } else {
+                                    pos_color(class, enhancements.dark).unwrap_or(fg)
+                                };
+                                let mut span = if selectable {
+                                    let index = order.get();
+                                    order.set(index + 1);
+                                    div().min_w_0().child(
+                                        SelectableText::new(
+                                            SharedString::from(format!("selection-run-{index}")),
+                                            chunk,
+                                        )
+                                        .document_order(index)
+                                        .text_style(
+                                            selectable_text_style(
+                                                color,
+                                                typography.body_size,
+                                                typography.line_height,
+                                                *code,
+                                                *bold,
+                                                *italic,
+                                                link.is_some() && typography.link_underline,
+                                            ),
+                                        ),
+                                    )
+                                } else {
+                                    let mut span = div()
+                                        .text_size(px(typography.body_size))
+                                        .line_height(px(typography.line_height))
+                                        .font_family(if *code { MONO_FONT } else { UI_FONT })
+                                        .text_color(color)
+                                        .child(SharedString::from(chunk));
+                                    if *bold {
+                                        span = span.font_weight(FontWeight::BOLD);
+                                    }
+                                    if *italic {
+                                        span = span.italic();
+                                    }
+                                    span
+                                };
+                                if *code {
+                                    span =
+                                        span.px_1().rounded_sm().bg(surface).font_family(MONO_FONT);
+                                }
+                                if let (Some(url), Some(handler)) = (link, link_click) {
+                                    let handler = handler.clone();
+                                    let url = url.clone();
+                                    row =
+                                        row.child(
+                                            span.id(SharedString::from(format!(
+                                                "rich-link-{sequence}"
+                                            )))
+                                            .cursor_pointer()
+                                            .underline()
+                                            .on_click(move |_, window, cx| {
+                                                handler(url.clone(), window, cx);
+                                            }),
+                                        );
+                                    sequence += 1;
+                                } else {
+                                    row = row.child(span);
+                                }
+                            }
+                        }
+                        crate::emoji::EmojiPiece::Emoji { path, .. } => {
+                            let mut icon =
+                                img(path).size(px(typography.body_size * 1.2)).rounded_sm();
+                            if let (Some(url), Some(handler)) = (link, link_click) {
+                                let handler = handler.clone();
+                                let url = url.clone();
+                                icon = icon.cursor_pointer().on_click(move |_, window, cx| {
+                                    handler(url.clone(), window, cx);
+                                });
+                            }
+                            row = row.child(icon);
+                        }
+                    }
+                }
+            }
+            Inline::Math(value) => {
+                if !value.is_empty() {
+                    row = row.child(
+                        div()
+                            .px_1()
+                            .text_size(px(typography.body_size))
+                            .line_height(px(typography.line_height))
+                            .text_color(accent)
+                            .italic()
+                            .child(SharedString::from(format!(
+                                " {} ",
+                                zhihu_content::format_math(value)
+                            ))),
+                    );
+                }
+            }
+            Inline::Image { alt, .. } => {
+                let label = if alt.is_empty() {
+                    "[图片]".to_string()
+                } else {
+                    format!("[图片: {alt}]")
+                };
+                row = row.child(
+                    div()
+                        .text_size(px(typography.body_size))
+                        .text_color(muted)
+                        .child(SharedString::from(label)),
+                );
+            }
+            Inline::LineBreak => {
+                row = row.child(div().w_full().h(px(0.)));
+            }
+        }
+    }
+    row.into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selectable_text_style(
+    color: Rgba,
+    size: f32,
+    line_height: f32,
+    code: bool,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+) -> TextStyleRefinement {
+    TextStyleRefinement {
+        color: Some(color.into()),
+        font_family: Some(if code { MONO_FONT } else { UI_FONT }.into()),
+        font_size: Some(px(size).into()),
+        line_height: Some(px(line_height).into()),
+        font_weight: bold.then_some(FontWeight::BOLD),
+        font_style: italic.then_some(FontStyle::Italic),
+        underline: underline.then(|| UnderlineStyle {
+            thickness: px(1.),
+            color: Some(color.into()),
+            wavy: false,
+        }),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn pos_color(class: crate::pos::WordClass, dark: bool) -> Option<Rgba> {
+    use crate::pos::WordClass;
+    Some(match (class, dark) {
+        (WordClass::Noun, true) => gpui_kit::rgb(0x8ab4d8),
+        (WordClass::Noun, false) => gpui_kit::rgb(0x1f5f8b),
+        (WordClass::Verb, true) => gpui_kit::rgb(0xd9ae72),
+        (WordClass::Verb, false) => gpui_kit::rgb(0x8a5a13),
+        (WordClass::Adjective, true) => gpui_kit::rgb(0x8fbf9f),
+        (WordClass::Adjective, false) => gpui_kit::rgb(0x2f6f4f),
+        (WordClass::Plain, _) => return None,
+    })
+}
+
+pub(crate) fn text_chunks(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut count = 0usize;
+    for (index, ch) in text.char_indices() {
+        count += 1;
+        let boundary = count >= 20
+            || ch.is_whitespace()
+            || matches!(
+                ch,
+                '，' | '。' | '！' | '？' | '；' | '：' | ',' | '.' | '!' | '?'
+            );
+        if boundary {
+            let end = index + ch.len_utf8();
+            if start < end {
+                chunks.push(&text[start..end]);
+            }
+            start = end;
+            count = 0;
+        }
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
 }
 
 #[allow(clippy::too_many_arguments)]

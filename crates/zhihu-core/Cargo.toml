@@ -17,5 +17,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "fs", 
 regex = "1.13.1"
 md-5 = "0.10"
 base64 = "0.22"
+serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }

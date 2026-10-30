@@ -7,7 +7,7 @@ use zhihu_ui::ZhihuApp;
 fn main() {
     zhihu_ui::install_panic_hook();
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets::new(""))
+        .with_assets(gpui_kit::assets::AllAssets::new(""))
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
             cx.set_app_identity("dev.zhihurs.app", "知乎 Rust");

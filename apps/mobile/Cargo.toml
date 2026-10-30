@@ -17,6 +17,7 @@ gpui_pre_reqwest = { workspace = true }
 reqwest_client = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
 gpui-mobile = { workspace = true }
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"

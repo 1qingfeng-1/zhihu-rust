@@ -2,22 +2,128 @@
 //! navigation and compact content cards.
 
 use gpui_kit::component::input::Input;
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, rgb, uniform_list, AnyElement, Context, Div, FontWeight, MouseButton, Rgba,
-    SharedString, Window,
+    div, img, px, rgb, uniform_list, Animation, AnimationExt as _, AnyElement, Context, Div,
+    Focusable, FontWeight, MouseButton, Rgba, SharedString, Window,
 };
-use zhihu_types::FeedItem;
+use zhihu_types::{FeedItem, FollowFeedKind};
 
+#[cfg(not(target_os = "android"))]
+use super::open_external;
 use super::{
-    daily_row, empty_state, feed_card, hot_row, open_external, safe_area, TypographyPreset,
-    ZhihuApp, TABS, UI_FONT,
+    daily_row, empty_state, feed_card, hot_row, safe_area, TypographyPreset, ZhihuApp, TABS,
+    UI_FONT,
 };
+
+fn unread_badge_label(count: u64) -> String {
+    if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    }
+}
+
+fn format_daily_date(date: &str) -> String {
+    if date.len() == 8 && date.chars().all(|ch| ch.is_ascii_digit()) {
+        format!("{} 年 {} 月 {} 日", &date[0..4], &date[4..6], &date[6..8])
+    } else {
+        date.to_string()
+    }
+}
 
 fn feed_card_height(item: &FeedItem) -> f32 {
-    let title_lines = item.title.chars().count().div_ceil(18).clamp(1, 2);
+    let title_lines = item.title.chars().count().div_ceil(18).max(1);
     let excerpt_lines = item.excerpt.chars().count().div_ceil(24).clamp(1, 3);
-    112.0 + title_lines as f32 * 24.0 + excerpt_lines as f32 * 20.0
+    let topic_height = if item.topic_refs.is_empty() {
+        0.0
+    } else {
+        26.0
+    };
+    112.0 + title_lines as f32 * 24.0 + excerpt_lines as f32 * 20.0 + topic_height
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Publish time for the timeline. Local-pool and sample items carry no
+/// timestamp, so they get a stable pseudo time derived from their id instead
+/// of shifting on every refresh.
+fn feed_item_time(item: &FeedItem) -> i64 {
+    if item.created_at > 0 {
+        return item.created_at;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    item.id.hash(&mut hasher);
+    let hours = (hasher.finish() % 72) as i64;
+    unix_now_secs() - hours * 3_600 - 600
+}
+
+fn relative_time_label(timestamp: i64) -> String {
+    let delta = (unix_now_secs() - timestamp).max(0);
+    match delta {
+        0..=59 => "刚刚".to_string(),
+        60..=3_599 => format!("{}分钟前", delta / 60),
+        3_600..=86_399 => format!("{}小时前", delta / 3_600),
+        86_400..=172_799 => "昨天".to_string(),
+        172_800..=604_799 => format!("{}天前", delta / 86_400),
+        _ => format!("{}周前", delta / 604_800),
+    }
+}
+
+/// One mobile feed cell on the timeline: a rail with a dot and publish time,
+/// then the card. The rail line bleeds past the row gap so the list reads as
+/// one continuous line while scrolling back through history.
+fn timeline_cell(time: String, read: bool, card: AnyElement, p: Palette) -> AnyElement {
+    div()
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .child(
+            div()
+                .relative()
+                .w(px(54.))
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(26.5))
+                        .top(px(-8.))
+                        .bottom(px(-8.))
+                        .w(px(1.))
+                        .bg(p.border),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt_3()
+                        .gap_1()
+                        .child(div().size(px(8.)).rounded_full().bg(if read {
+                            p.muted
+                        } else {
+                            p.accent
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .text_size(px(10.))
+                                .text_color(p.muted)
+                                .text_center()
+                                .child(SharedString::from(time)),
+                        ),
+                ),
+        )
+        .child(div().flex_1().min_w_0().child(card))
+        .into_any_element()
 }
 
 #[derive(Clone, Copy)]
@@ -111,30 +217,7 @@ impl ZhihuApp {
             .items_center()
             .justify_between()
             .bg(p.bg)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().size(px(20.)).rounded_md().bg(p.accent))
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(p.fg)
-                            .child("知乎"),
-                    )
-                    .child(
-                        div()
-                            .px_1()
-                            .py_0p5()
-                            .rounded_sm()
-                            .bg(p.elevated)
-                            .text_xs()
-                            .text_color(p.muted)
-                            .child("Rust"),
-                    ),
-            )
+            .child(self.search_pill(p, cx, true))
             .child(
                 div()
                     .flex()
@@ -150,7 +233,18 @@ impl ZhihuApp {
                                 this.open_notifications();
                                 cx.notify();
                             }))
-                            .child("消息"),
+                            .child("消息")
+                            .children((self.notification_unread > 0).then(|| {
+                                div()
+                                    .px_1()
+                                    .rounded_full()
+                                    .bg(p.danger)
+                                    .text_xs()
+                                    .text_color(rgb(0xffffff))
+                                    .child(SharedString::from(unread_badge_label(
+                                        self.notification_unread,
+                                    )))
+                            })),
                     )
                     .child(
                         div()
@@ -166,54 +260,16 @@ impl ZhihuApp {
                                 this.select_tab(4);
                                 cx.notify();
                             }))
-                            .child(
+                            .child(if let Some(url) = self.avatar_url() {
+                                img(url).size(px(30.)).rounded_full().into_any_element()
+                            } else {
                                 div()
                                     .text_xs()
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(if logged_in { p.accent_text } else { p.muted })
-                                    .child(SharedString::from(avatar)),
-                            ),
-                    ),
-            );
-
-        let search = div()
-            .px_4()
-            .pb_2()
-            .bg(p.bg)
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                Input::new(&self.search)
-                    .flex_1()
-                    .h(px(40.))
-                    .rounded_full()
-                    .bg(p.elevated)
-                    .text_color(p.fg),
-            )
-            .child(
-                div()
-                    .id("search-go")
-                    .size(px(40.))
-                    .rounded_full()
-                    .bg(p.accent)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let query = this.search.read(cx).value().trim().to_string();
-                        if !query.is_empty() {
-                            this.open_search(query);
-                            cx.notify();
-                        }
-                    }))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(p.accent_text)
-                            .child("搜索"),
+                                    .child(SharedString::from(avatar))
+                                    .into_any_element()
+                            }),
                     ),
             );
 
@@ -221,15 +277,24 @@ impl ZhihuApp {
             self.render_blocklist_panel(cx, &p)
         } else {
             match self.tab {
-                0 | 1 => self.render_feed_list(cx, p, wide),
+                0 => self.render_feed_list(cx, p, wide),
+                1 => self.render_follow_list(window, cx, p, wide),
                 2 => self.render_hot_list(cx, p),
                 3 => self.render_daily_list(cx, p),
                 _ => self.render_profile(cx, &p),
             }
         };
+        // Only the tab content follows the finger; the header, the bottom tab
+        // bar and the 关注 sub-tabs stay put.
+        let content = if self.tab == 1 && !self.blocklist_open {
+            content
+        } else {
+            self.slide_wrap(content, window, p.bg)
+        };
 
         let tab_error = match self.tab {
-            0 | 1 => self.feed_error.as_ref(),
+            0 => self.feed_error.as_ref(),
+            1 => self.follow_state().error.as_ref(),
             2 => self.hot_error.as_ref(),
             3 => self.daily_error.as_ref(),
             _ => self.error.as_ref(),
@@ -238,7 +303,7 @@ impl ZhihuApp {
             error.clone()
         } else {
             match self.tab {
-                0 | 1 => {
+                0 => {
                     let count = if self.feed.is_empty() {
                         self.items.len()
                     } else {
@@ -246,6 +311,11 @@ impl ZhihuApp {
                     };
                     format!("推荐 · {count} 条")
                 }
+                1 => format!(
+                    "关注 · {} · {} 条",
+                    self.follow_tab.label(),
+                    self.follow_state().items.len()
+                ),
                 2 => format!("热榜 · {} 条", self.hot.len()),
                 3 => format!("日报 · {} 条", self.daily.len()),
                 _ => {
@@ -263,7 +333,6 @@ impl ZhihuApp {
             .px_4()
             .flex()
             .items_center()
-            .justify_between()
             .bg(p.bg)
             .child(
                 div()
@@ -277,19 +346,6 @@ impl ZhihuApp {
                         p.muted
                     })
                     .child(SharedString::from(status_text)),
-            )
-            .child(
-                div()
-                    .id("home-blocklist")
-                    .text_xs()
-                    .text_color(p.accent)
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.blocklist = this.services.block_keywords();
-                        this.blocklist_open = true;
-                        cx.notify();
-                    }))
-                    .child("屏蔽词"),
             );
 
         let nav = div()
@@ -300,6 +356,13 @@ impl ZhihuApp {
             .flex()
             .children(NAV.iter().enumerate().map(|(index, label)| {
                 let active = self.tab == index;
+                let icon = match index {
+                    0 => gpui_kit::assets::IconName::House,
+                    1 => gpui_kit::assets::IconName::Users,
+                    2 => gpui_kit::assets::IconName::Flame,
+                    3 => gpui_kit::assets::IconName::Newspaper,
+                    _ => gpui_kit::assets::IconName::User,
+                };
                 div()
                     .id(("bottom-nav", index))
                     .aria_label(SharedString::from(*label))
@@ -310,16 +373,16 @@ impl ZhihuApp {
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap_1()
+                    .gap_0p5()
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_tab(index);
                         cx.notify();
                     }))
-                    .child(div().h(px(2.)).w(px(18.)).rounded_full().bg(if active {
+                    .child(Icon::new(icon).size(px(20.)).text_color(if active {
                         p.accent
                     } else {
-                        p.surface
+                        p.muted
                     }))
                     .child(
                         div()
@@ -337,6 +400,11 @@ impl ZhihuApp {
         if wide {
             let sidebar = self.render_sidebar(cx, p);
             let title = TABS[self.tab.min(TABS.len() - 1)];
+            let subtitle = if self.tab == 0 {
+                format!("知乎 · Rust 客户端 · 来源：{}", self.feed_source.label())
+            } else {
+                "知乎 · Rust 客户端".to_string()
+            };
             let page_header = div()
                 .h(px(56.))
                 .px_6()
@@ -362,7 +430,7 @@ impl ZhihuApp {
                             div()
                                 .text_xs()
                                 .text_color(p.muted)
-                                .child("知乎 · Rust 客户端"),
+                                .child(SharedString::from(subtitle.clone())),
                         ),
                 )
                 .child(
@@ -470,7 +538,6 @@ impl ZhihuApp {
                 }),
             )
             .child(header)
-            .child(search)
             .child(
                 div()
                     .relative()
@@ -482,6 +549,70 @@ impl ZhihuApp {
             .child(status)
             .child(nav)
             .into_any_element()
+    }
+
+    /// Wide search entry used in the header row: icon plus a vertically
+    /// rotating hot-search label. Tapping opens the search page.
+    fn search_pill(&self, p: Palette, cx: &mut Context<Self>, grow: bool) -> AnyElement {
+        let hot = self
+            .hot
+            .get(self.hot_rotate_index)
+            .map(|item| item.query.clone())
+            .unwrap_or_else(|| "搜索知乎".to_string());
+        let index = self.hot_rotate_index;
+        let animation = Animation::new(std::time::Duration::from_millis(220))
+            .with_easing(gpui_kit::base::animation::ease_out_cubic);
+        let mut pill = div()
+            .id("home-search-pill")
+            .h(px(36.))
+            .px_3()
+            .rounded_full()
+            .bg(p.elevated)
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.search
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                this.open_search_entry(cx);
+                let handle = this.search.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+                cx.notify();
+            }))
+            .child(
+                Icon::new(IconName::Search)
+                    .size(px(15.))
+                    .text_color(p.muted),
+            )
+            .child(
+                div().flex_1().min_w_0().h(px(20.)).overflow_hidden().child(
+                    div()
+                        .w_full()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .with_animation(
+                            SharedString::from(format!("hot-rotate-{index}")),
+                            animation,
+                            move |element, delta| element.mt(px(20.0 * (1.0 - delta))),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .text_sm()
+                                .text_color(p.muted)
+                                .child(SharedString::from(hot)),
+                        ),
+                ),
+            );
+        if grow {
+            pill = pill.flex_1().min_w_0().mx_3();
+        } else {
+            pill = pill.w_full();
+        }
+        pill.into_any_element()
     }
 
     /// Left navigation rail used when the desktop window is wide enough.
@@ -766,13 +897,16 @@ impl ZhihuApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
+                    .child(if let Some(url) = self.avatar_url() {
+                        img(url).size(px(28.)).rounded_full().into_any_element()
+                    } else {
                         div()
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
                             .text_color(if logged_in { p.accent_text } else { p.muted })
-                            .child(SharedString::from(avatar)),
-                    ),
+                            .child(SharedString::from(avatar))
+                            .into_any_element()
+                    }),
             );
         if !collapsed {
             account = account.child(
@@ -808,13 +942,7 @@ impl ZhihuApp {
             sidebar = sidebar.child(mini);
         } else {
             sidebar = sidebar
-                .child(
-                    Input::new(&self.search)
-                        .h(px(38.))
-                        .rounded_md()
-                        .bg(p.elevated)
-                        .text_color(p.fg),
-                )
+                .child(self.search_pill(p, cx, false))
                 .child(browse_section)
                 .child(my_section);
         }
@@ -878,6 +1006,19 @@ impl ZhihuApp {
                     .text_color(if active { p.fg } else { p.muted })
                     .child(SharedString::from(label.to_string())),
             )
+            .children(
+                (id == "side-notifications" && self.notification_unread > 0).then(|| {
+                    div()
+                        .px_1()
+                        .rounded_full()
+                        .bg(p.danger)
+                        .text_xs()
+                        .text_color(rgb(0xffffff))
+                        .child(SharedString::from(unread_badge_label(
+                            self.notification_unread,
+                        )))
+                }),
+            )
             .into_any_element()
     }
 
@@ -913,14 +1054,30 @@ impl ZhihuApp {
             }))
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(if active {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .text_color(if active { p.accent } else { p.muted })
-                    .child(SharedString::from(short.to_string())),
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(if active {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if active { p.accent } else { p.muted })
+                            .child(SharedString::from(short.to_string())),
+                    )
+                    .children(
+                        (id == "mini-notifications" && self.notification_unread > 0).then(|| {
+                            div()
+                                .text_xs()
+                                .text_color(p.danger)
+                                .child(SharedString::from(unread_badge_label(
+                                    self.notification_unread,
+                                )))
+                        }),
+                    ),
             )
             .into_any_element()
     }
@@ -988,7 +1145,13 @@ impl ZhihuApp {
                 .map(|(index, _)| index)
                 .unwrap_or(0);
             heights[column] += feed_card_height(item);
-            columns[column].push(feed_card(
+            let read = self.is_read(item.kind, &item.id);
+            let stamp = self
+                .feed_times
+                .get(&item.id)
+                .copied()
+                .unwrap_or_else(|| feed_item_time(item));
+            let card = feed_card(
                 item,
                 &entity,
                 p.surface,
@@ -997,10 +1160,37 @@ impl ZhihuApp {
                 p.border,
                 p.accent,
                 self.card_offset(&item.id),
-            ));
+                wide,
+                read,
+            );
+            // Mobile uses a single column, so every card can hang off a
+            // timeline rail with its publish time; the wide desktop layout
+            // keeps the waterfall grid.
+            columns[column].push(if wide {
+                card
+            } else {
+                timeline_cell(relative_time_label(stamp), read, card, p)
+            });
         }
 
-        let mut row = div().flex().items_start().gap_4().px_4().pb_4();
+        let mut row = if wide {
+            div()
+                .w_full()
+                .flex()
+                .items_start()
+                .flex_shrink_0()
+                .gap_4()
+                .px_4()
+                .pb_4()
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .items_start()
+                .flex_shrink_0()
+                .gap_3()
+                .pb_4()
+        };
         for column in columns {
             row = row.child(
                 div()
@@ -1036,6 +1226,7 @@ impl ZhihuApp {
             .id("feed-load-more")
             .h(px(52.))
             .w_full()
+            .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
@@ -1073,17 +1264,238 @@ impl ZhihuApp {
             .child(row)
             .child(footer);
 
+        // Always bound the list to the remaining height: a bare `flex_1`
+        // scroll container inside a non-flex parent takes its content height,
+        // which makes `max_offset` zero and lets cards spill past the tab bar.
+        let mut container = div().size_full().flex().flex_col();
         if using_real_feed {
-            div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(self.render_pull_bar(p))
-                .child(scroll)
-                .into_any_element()
-        } else {
-            scroll.into_any_element()
+            container = container.child(self.render_pull_bar(p));
         }
+        container.child(scroll).into_any_element()
+    }
+
+    fn render_follow_list(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        p: Palette,
+        wide: bool,
+    ) -> AnyElement {
+        let mut tabs = div()
+            .id("follow-subtabs")
+            .h(px(42.))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(p.bg)
+            .border_b_1()
+            .border_color(p.border);
+        for kind in [FollowFeedKind::Recommend, FollowFeedKind::Activity] {
+            let active = self.follow_tab == kind;
+            tabs = tabs.child(
+                div()
+                    .id(SharedString::from(format!("follow-tab-{}", kind.label())))
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_b_1()
+                    .border_color(if active { p.accent } else { p.border })
+                    .text_sm()
+                    .font_weight(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if active { p.fg } else { p.muted })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.switch_follow_tab(kind, cx);
+                    }))
+                    .child(kind.label()),
+            );
+        }
+
+        let body = self.render_follow_body(cx, p, wide);
+        // Only the feed below the 推荐/动态 bar slides; the bar itself is fixed.
+        let body = self.slide_wrap(body, window, p.bg);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(tabs)
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
+    fn render_follow_body(&mut self, cx: &mut Context<Self>, p: Palette, wide: bool) -> AnyElement {
+        let kind = self.follow_tab;
+        let index = super::follow_index(kind);
+        let state = &self.follow_feeds[index];
+        let count = state.items.len();
+        if !self.is_logged_in() {
+            return empty_state("登录后可查看关注内容", p.muted).into_any_element();
+        }
+        if state.loading && count == 0 {
+            return empty_state("加载中…", p.muted).into_any_element();
+        }
+        if let Some(error) = &state.error {
+            if count == 0 {
+                return div()
+                    .size_full()
+                    .p_4()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xdc2626))
+                            .child(SharedString::from(error.clone())),
+                    )
+                    .into_any_element();
+            }
+        }
+        if count == 0 {
+            return empty_state(
+                if kind == FollowFeedKind::Recommend {
+                    "暂无关注推荐"
+                } else {
+                    "暂无关注动态"
+                },
+                p.muted,
+            )
+            .into_any_element();
+        }
+
+        let entity = cx.entity().downgrade();
+        let items = &self.follow_feeds[index].items;
+        let column_count = if wide { 2 } else { 1 };
+        let mut columns: Vec<Vec<AnyElement>> = (0..column_count).map(|_| Vec::new()).collect();
+        let mut heights = vec![0.0f32; column_count];
+        for item in items {
+            let column = heights
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            heights[column] += feed_card_height(item);
+            let read = self.is_read(item.kind, &item.id);
+            let stamp = self
+                .feed_times
+                .get(&item.id)
+                .copied()
+                .unwrap_or_else(|| feed_item_time(item));
+            let card = feed_card(
+                item,
+                &entity,
+                p.surface,
+                p.fg,
+                p.muted,
+                p.border,
+                p.accent,
+                self.card_offset(&item.id),
+                wide,
+                read,
+            );
+            // Mobile uses a single column, so every card can hang off a
+            // timeline rail with its publish time; the wide desktop layout
+            // keeps the waterfall grid.
+            columns[column].push(if wide {
+                card
+            } else {
+                timeline_cell(relative_time_label(stamp), read, card, p)
+            });
+        }
+        let mut row = if wide {
+            div()
+                .w_full()
+                .flex()
+                .items_start()
+                .flex_shrink_0()
+                .gap_4()
+                .px_4()
+                .pb_4()
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .items_start()
+                .flex_shrink_0()
+                .gap_3()
+                .pb_4()
+        };
+        for column in columns {
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(column),
+            );
+        }
+
+        let state = &self.follow_feeds[index];
+        let loadable = !state.is_end && !state.loading && !state.loading_more;
+        let footer_text = if state.loading_more {
+            "加载中…".to_string()
+        } else if state.is_end {
+            "没有更多了".to_string()
+        } else {
+            "继续滚动加载更多（点击也可加载）".to_string()
+        };
+        let mut footer = div()
+            .id(SharedString::from(format!("follow-load-more-{index}")))
+            .h(px(52.))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_xs()
+            .text_color(if loadable { p.accent } else { p.muted })
+            .child(SharedString::from(footer_text));
+        if loadable {
+            footer = footer
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.load_more_follow_feed(cx);
+                }));
+        }
+
+        let scroll = div()
+            .id(SharedString::from(format!(
+                "follow-scroll-{index}-{}",
+                self.list_epoch
+            )))
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .track_scroll(&self.feed_scroll)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui_kit::MouseDownEvent, _, _| {
+                    this.start_feed_gesture(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                    );
+                }),
+            )
+            .child(row)
+            .child(footer);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.render_pull_bar(p))
+            .child(scroll)
+            .into_any_element()
     }
 
     fn render_pull_bar(&self, p: Palette) -> AnyElement {
@@ -1165,29 +1577,89 @@ impl ZhihuApp {
             )
             .into_any_element();
         }
-        let count = self.daily.len();
-        let list_id = format!("home-daily-{}", self.list_epoch);
         let entity = cx.entity().downgrade();
-        uniform_list(
-            list_id,
-            count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, _| {
-                let mut rows = Vec::with_capacity(range.len());
-                for index in range {
-                    rows.push(daily_row(
-                        &this.daily[index],
-                        &entity,
-                        p.surface,
-                        p.fg,
-                        p.muted,
-                        p.border,
-                    ));
-                }
-                rows
-            }),
-        )
-        .size_full()
-        .into_any_element()
+        let mut column = div()
+            .id(SharedString::from(format!(
+                "home-daily-{}",
+                self.list_epoch
+            )))
+            .size_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        let mut current_date = String::new();
+        for story in &self.daily {
+            if story.date != current_date {
+                current_date = story.date.clone();
+                column = column.child(
+                    div()
+                        .w_full()
+                        .px_4()
+                        .pt_4()
+                        .pb_1()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(p.fg)
+                        .child(SharedString::from(format_daily_date(&current_date))),
+                );
+            }
+            column = column.child(daily_row(
+                story, &entity, p.surface, p.fg, p.muted, p.border,
+            ));
+        }
+        if let Some(error) = &self.daily_error {
+            column = column.child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_xs()
+                    .text_color(p.danger)
+                    .child(SharedString::from(error.clone())),
+            );
+        }
+        if self.daily_end {
+            column = column.child(
+                div()
+                    .h(px(44.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(p.muted)
+                    .child("没有更早的日报"),
+            );
+        } else {
+            let date = self.daily.last().map(|story| story.date.clone());
+            column = column.child(
+                div()
+                    .id("daily-load-more")
+                    .h(px(48.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(p.accent)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.daily_loading_more {
+                            return;
+                        }
+                        let Some(date) = date.clone() else {
+                            return;
+                        };
+                        this.daily_loading_more = true;
+                        this.daily_error = None;
+                        this.services.load_more_daily(date);
+                        cx.notify();
+                    }))
+                    .child(if self.daily_loading_more {
+                        "加载中…"
+                    } else {
+                        "加载更早的日报"
+                    }),
+            );
+        }
+        column.into_any_element()
     }
 
     fn render_profile(&mut self, cx: &mut Context<Self>, p: &Palette) -> AnyElement {
@@ -1244,13 +1716,16 @@ impl ZhihuApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(
+                            .child(if let Some(url) = self.avatar_url() {
+                                img(url).size(px(52.)).rounded_full().into_any_element()
+                            } else {
                                 div()
                                     .text_lg()
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(if logged_in { p.accent_text } else { p.muted })
-                                    .child(SharedString::from(profile_avatar)),
-                            ),
+                                    .child(SharedString::from(profile_avatar))
+                                    .into_any_element()
+                            }),
                     )
                     .child(
                         div()
@@ -1285,18 +1760,11 @@ impl ZhihuApp {
                             .text_color(if logged_in { p.muted } else { p.accent_text })
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.login_open = !this.login_open;
-                                this.blocklist_open = false;
-                                cx.notify();
+                                this.open_login(cx);
                             }))
                             .child(if logged_in { "切换账号" } else { "登录" }),
                     ),
-            )
-            .child(if self.login_open {
-                self.render_login_form(cx, p)
-            } else {
-                div()
-            });
+            );
 
         let setting_row = |label: &'static str, value: String| {
             div()
@@ -1506,6 +1974,147 @@ impl ZhihuApp {
                     ),
             );
 
+        let reading_options = div()
+            .w_full()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(div().text_sm().text_color(p.fg).child("首行缩进"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .child("正文段落首行缩进两个全角字符"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("reading-indent-toggle")
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .bg(if self.reading_indent {
+                                p.accent
+                            } else {
+                                p.elevated
+                            })
+                            .text_xs()
+                            .text_color(if self.reading_indent {
+                                p.accent_text
+                            } else {
+                                p.muted
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_reading_indent();
+                                cx.notify();
+                            }))
+                            .child(if self.reading_indent { "开" } else { "关" }),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(div().text_sm().text_color(p.fg).child("词性着色"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .child("名词 / 动词 / 形容词使用克制的阅读配色"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("pos-colors-toggle")
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .bg(if self.pos_colors {
+                                p.accent
+                            } else {
+                                p.elevated
+                            })
+                            .text_xs()
+                            .text_color(if self.pos_colors {
+                                p.accent_text
+                            } else {
+                                p.muted
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_pos_colors();
+                                cx.notify();
+                            }))
+                            .child(if self.pos_colors { "开" } else { "关" }),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(div().text_sm().text_color(p.fg).child("屏蔽 MCN 推荐"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .child("推荐流中隐藏已识别为 MCN 机构的作者"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("hide-mcn-toggle")
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .bg(if self.hide_mcn { p.accent } else { p.elevated })
+                            .text_xs()
+                            .text_color(if self.hide_mcn {
+                                p.accent_text
+                            } else {
+                                p.muted
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_hide_mcn();
+                                cx.notify();
+                            }))
+                            .child(if self.hide_mcn { "开" } else { "关" }),
+                    ),
+            );
+
         let recommend_row = div()
             .w_full()
             .px_4()
@@ -1554,6 +2163,51 @@ impl ZhihuApp {
                 ),
             );
 
+        let recommend_preset_row = div()
+            .w_full()
+            .px_4()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(div().text_sm().text_color(p.fg).child("推荐预设"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.muted)
+                            .child(self.recommend_preset.description()),
+                    ),
+            )
+            .child(div().w_full().flex().gap_2().children(
+                super::RecommendPreset::ALL.into_iter().map(|preset| {
+                    let active = self.recommend_preset == preset;
+                    div()
+                        .id(SharedString::from(format!(
+                            "recommend-preset-{}",
+                            preset.as_str()
+                        )))
+                        .flex_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_center()
+                        .bg(if active { p.accent } else { p.elevated })
+                        .text_xs()
+                        .text_color(if active { p.accent_text } else { p.muted })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_recommend_preset(preset, cx);
+                        }))
+                        .child(preset.label())
+                }),
+            ));
+
         let recommend_data_row = div()
             .w_full()
             .px_4()
@@ -1595,6 +2249,171 @@ impl ZhihuApp {
                     ),
             );
 
+        let collect_status = if self.recommend_collecting {
+            "正在采集…".to_string()
+        } else if let Some(report) = &self.recommend_last_report {
+            if let Some(error) = &report.error {
+                format!("上次失败：{error}")
+            } else if report.cancelled {
+                "上次已取消".to_string()
+            } else {
+                format!("上次采集 {} 条，新增 {}", report.fetched, report.inserted)
+            }
+        } else {
+            "默认关闭，仅保存标题、摘要与计数".to_string()
+        };
+        let pool_text = format!(
+            "候选池 {} 条 · 向量 {} 条 · 约 {} KB",
+            self.recommend_pool.items,
+            self.recommend_vectors,
+            self.recommend_pool.approx_bytes / 1024
+        );
+        let collection_enabled = self.services.recommend_collection_enabled();
+        let collect_toggle = div()
+            .id("recommend-collect-toggle")
+            .px_3()
+            .py_1()
+            .rounded_full()
+            .bg(if collection_enabled {
+                p.accent
+            } else {
+                p.elevated
+            })
+            .text_xs()
+            .text_color(if collection_enabled {
+                p.accent_text
+            } else {
+                p.muted
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_recommend_collection(cx);
+            }))
+            .child(if collection_enabled { "开" } else { "关" });
+        let collect_button = if self.recommend_collecting {
+            div()
+                .id("recommend-collect-cancel")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(p.elevated)
+                .text_xs()
+                .text_color(p.muted)
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.cancel_recommend_collection(cx);
+                }))
+                .child("取消")
+        } else {
+            div()
+                .id("recommend-collect-now")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(if collection_enabled {
+                    p.accent
+                } else {
+                    p.elevated
+                })
+                .text_xs()
+                .text_color(if collection_enabled {
+                    p.accent_text
+                } else {
+                    p.muted
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.start_recommend_collection(cx);
+                }))
+                .child("立即采集")
+        };
+        let recommend_collect_row = div()
+            .w_full()
+            .px_4()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(div().text_sm().text_color(p.fg).child("本地推荐采集"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .child(SharedString::from(collect_status)),
+                            ),
+                    )
+                    .child(collect_toggle),
+            )
+            .child(
+                div()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.muted)
+                                    .child(SharedString::from(pool_text)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if self.recommend_embedding_fallback {
+                                        p.danger
+                                    } else {
+                                        p.muted
+                                    })
+                                    .child(SharedString::from(
+                                        if self.recommend_embedding_fallback {
+                                            format!(
+                                                "{}（ONNX 不可用，统计回退）",
+                                                self.recommend_model
+                                            )
+                                        } else {
+                                            self.recommend_model.clone()
+                                        },
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(collect_button)
+                            .child(
+                                div()
+                                    .id("recommend-pool-clear")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(p.elevated)
+                                    .text_xs()
+                                    .text_color(p.danger)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.clear_recommend_pool(cx);
+                                    }))
+                                    .child("清除候选池"),
+                            ),
+                    ),
+            );
+
         let block_row = div()
             .id("profile-blocklist")
             .w_full()
@@ -1617,6 +2436,45 @@ impl ZhihuApp {
                     .text_sm()
                     .text_color(p.muted)
                     .child(SharedString::from(format!("{} 条", self.blocklist.len()))),
+            );
+
+        let collection_row = div()
+            .id("profile-collections")
+            .w_full()
+            .px_4()
+            .py_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(p.border)
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_collections(cx);
+            }))
+            .child(div().text_sm().text_color(p.fg).child("我的收藏"))
+            .child(div().text_sm().text_color(p.muted).child("查看"));
+
+        let notes_row = div()
+            .id("profile-notes")
+            .w_full()
+            .px_4()
+            .py_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(p.border)
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_notes(cx);
+            }))
+            .child(div().text_sm().text_color(p.fg).child("阅读笔记"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(p.muted)
+                    .child(SharedString::from(format!("{} 条", self.highlights.len()))),
             );
 
         let history_row = div()
@@ -1710,31 +2568,100 @@ impl ZhihuApp {
             .child(div().text_sm().text_color(p.fg).child("消息中心"))
             .child(div().text_sm().text_color(p.muted).child("查看"));
 
-        let settings = div()
+        let login_row = div()
+            .id("profile-login-row")
             .w_full()
-            .flex_shrink_0()
-            .bg(p.surface)
-            .border_1()
+            .px_4()
+            .py_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
             .border_color(p.border)
-            .rounded_lg()
-            .overflow_hidden()
-            .child(theme_row)
-            .child(font_row)
-            .child(line_row)
-            .child(typography_row)
-            .child(typography_preview)
-            .child(recommend_row)
-            .child(recommend_data_row)
-            .child(block_row)
-            .child(history_row)
-            .child(crash_row)
-            .child(diag_row)
-            .child(tts_row)
-            .child(notification_row)
-            .child(setting_row(
-                "关于",
-                format!("知乎 Rust · M5 · {}", env!("CARGO_PKG_VERSION")),
-            ));
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_login(cx);
+            }))
+            .child(div().text_sm().text_color(p.fg).child(if logged_in {
+                "切换账号"
+            } else {
+                "登录"
+            }))
+            .child(div().text_sm().text_color(p.muted).child(if logged_in {
+                "已登录"
+            } else {
+                "未登录"
+            }));
+
+        let account_group = self.profile_group(
+            0,
+            "账号与登录",
+            "登录状态 · 消息中心",
+            p,
+            vec![
+                login_row.into_any_element(),
+                notification_row.into_any_element(),
+            ],
+            cx,
+        );
+        let content_group = self.profile_group(
+            1,
+            "我的内容",
+            "收藏 · 笔记 · 历史",
+            p,
+            vec![
+                collection_row.into_any_element(),
+                notes_row.into_any_element(),
+                history_row.into_any_element(),
+            ],
+            cx,
+        );
+        let recommend_group = self.profile_group(
+            2,
+            "推荐设置",
+            "排序 · 预设 · 数据 · 采集",
+            p,
+            vec![
+                recommend_row.into_any_element(),
+                recommend_preset_row.into_any_element(),
+                recommend_data_row.into_any_element(),
+                recommend_collect_row.into_any_element(),
+            ],
+            cx,
+        );
+        let reading_group = self.profile_group(
+            3,
+            "阅读与外观",
+            "深色 · 字号 · 行距 · 排版 · 朗读",
+            p,
+            vec![
+                theme_row.into_any_element(),
+                font_row.into_any_element(),
+                line_row.into_any_element(),
+                typography_row.into_any_element(),
+                typography_preview.into_any_element(),
+                reading_options.into_any_element(),
+                tts_row.into_any_element(),
+            ],
+            cx,
+        );
+        let tools_group = self.profile_group(
+            4,
+            "其他工具",
+            "屏蔽管理 · 崩溃记录 · 诊断 · 关于",
+            p,
+            vec![
+                block_row.into_any_element(),
+                crash_row.into_any_element(),
+                diag_row.into_any_element(),
+                setting_row(
+                    "关于",
+                    format!("知乎 Rust · M5 · {}", env!("CARGO_PKG_VERSION")),
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
 
         div()
             .id("profile-scroll")
@@ -1747,8 +2674,79 @@ impl ZhihuApp {
             .flex_col()
             .gap_3()
             .child(account_card)
-            .child(settings)
+            .child(account_group)
+            .child(content_group)
+            .child(recommend_group)
+            .child(reading_group)
+            .child(tools_group)
             .into_any_element()
+    }
+
+    /// One collapsible 我的 section: header row plus rows shown only when open.
+    fn profile_group(
+        &mut self,
+        index: usize,
+        title: &'static str,
+        hint: &'static str,
+        p: &Palette,
+        body: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let expanded = self.profile_expanded.get(index).copied().unwrap_or(false);
+        let mut card = div()
+            .w_full()
+            .flex_shrink_0()
+            .bg(p.surface)
+            .border_1()
+            .border_color(p.border)
+            .rounded_lg()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(("profile-group", index))
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(open) = this.profile_expanded.get_mut(index) {
+                            *open = !*open;
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.fg)
+                                    .child(title),
+                            )
+                            .child(div().text_xs().text_color(p.muted).child(hint)),
+                    )
+                    .child(
+                        Icon::new(if expanded {
+                            gpui_kit::assets::IconName::ChevronUp
+                        } else {
+                            gpui_kit::assets::IconName::ChevronDown
+                        })
+                        .size(px(16.))
+                        .text_color(p.muted),
+                    ),
+            );
+        if expanded {
+            for row in body {
+                card = card.child(row);
+            }
+        }
+        card.into_any_element()
     }
 
     fn render_login_form(&self, cx: &mut Context<Self>, p: &Palette) -> Div {
@@ -1959,6 +2957,29 @@ impl ZhihuApp {
                         .child("导入并校验"),
                 ),
             )
+            .child({
+                #[cfg(target_os = "android")]
+                {
+                    div()
+                        .id("web-login")
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(p.elevated)
+                        .text_sm()
+                        .text_color(p.accent)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_web_login(cx);
+                        }))
+                        .child("浏览器登录（自动导入）")
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    div()
+                }
+            })
             .child(if let Some((message, redirect)) = &self.qr_risk {
                 let target = redirect
                     .clone()
@@ -1994,9 +3015,30 @@ impl ZhihuApp {
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.accent_text)
                                     .cursor_pointer()
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        open_external(&target);
-                                        cx.stop_propagation();
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let _ = &this;
+                                        #[cfg(target_os = "android")]
+                                        {
+                                            let pairs = this
+                                                .qr_risk_cookies
+                                                .iter()
+                                                .map(|(name, value)| format!("{name}={value}"))
+                                                .collect::<Vec<_>>()
+                                                .join("\u{1}");
+                                            if let Err(error) =
+                                                crate::android_login::open_risk_control(
+                                                    &target, &pairs,
+                                                )
+                                            {
+                                                this.login_status =
+                                                    Some(format!("打开验证页失败：{error}"));
+                                            }
+                                        }
+                                        #[cfg(not(target_os = "android"))]
+                                        {
+                                            open_external(&target);
+                                        }
+                                        cx.notify();
                                     }))
                                     .child("打开验证页面"),
                             )
@@ -2012,11 +3054,14 @@ impl ZhihuApp {
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.qr_risk = None;
-                                        this.qr_status = Some("正在重试获取二维码…".to_string());
-                                        this.services.start_qr_login();
+                                        this.qr_status =
+                                            Some("正在用验证后的会话重新获取二维码…".to_string());
+                                        this.services.start_qr_login_with_cookies(
+                                            this.qr_risk_cookies.clone(),
+                                        );
                                         cx.notify();
                                     }))
-                                    .child("重试"),
+                                    .child("完成验证后继续扫码"),
                             ),
                     )
                     .child(
@@ -2047,6 +3092,94 @@ impl ZhihuApp {
                             .unwrap_or_default(),
                     ))
             })
+    }
+
+    /// Open the standalone sign-in page.
+    pub(crate) fn open_login(&mut self, cx: &mut Context<Self>) {
+        self.login_open = false;
+        self.blocklist_open = false;
+        if !matches!(self.stack.last(), Some(super::Route::Login)) {
+            self.stack.push(super::Route::Login);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn render_login_page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = palette(self.dark);
+        let (inset_top, inset_bottom, inset_left, inset_right) = safe_area();
+        let logged_in = self.is_logged_in();
+        let header = div()
+            .h(px(56.))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(p.border)
+            .bg(p.surface)
+            .child(
+                div()
+                    .id("login-back")
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.back();
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(gpui_kit::assets::IconName::ArrowLeft)
+                            .size(px(20.))
+                            .text_color(p.accent),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_base()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(p.fg)
+                    .child("登录"),
+            )
+            .child(div().text_xs().text_color(p.muted).child(if logged_in {
+                "已登录"
+            } else {
+                "未登录"
+            }));
+
+        let form = self.render_login_form(cx, &p);
+        let _ = window;
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(p.bg)
+            .text_color(p.fg)
+            .font_family(UI_FONT)
+            .pt(px(inset_top))
+            .pb(px(inset_bottom))
+            .pl(px(inset_left))
+            .pr(px(inset_right))
+            .child(header)
+            .child(
+                div()
+                    .id("login-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(form),
+            )
+            .into_any_element()
     }
 
     fn render_blocklist_panel(&mut self, cx: &mut Context<Self>, p: &Palette) -> AnyElement {
