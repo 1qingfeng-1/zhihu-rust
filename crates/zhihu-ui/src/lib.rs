@@ -8027,7 +8027,17 @@ impl ZhihuApp {
             for item in &self.search_results {
                 let read = self.is_read(item.kind, &item.id);
                 column = column.child(feed_card(
-                    item, &entity, surface, fg, muted, border, accent, 0.0, true, read,
+                    item,
+                    &entity,
+                    surface,
+                    fg,
+                    muted,
+                    border,
+                    accent,
+                    0.0,
+                    true,
+                    read,
+                    String::new(),
                 ));
             }
             if self.search_end {
@@ -8628,7 +8638,8 @@ impl ZhihuApp {
         let header_question_click = header_question.clone();
 
         let header = div()
-            .min_h(px(56.))
+            .h(px(56.))
+            .flex_shrink_0()
             .px_3()
             .py_2()
             .flex()
@@ -8663,6 +8674,7 @@ impl ZhihuApp {
                     .min_w_0()
                     .text_lg()
                     .line_height(px(24.))
+                    .line_clamp(1)
                     .font_weight(FontWeight::BOLD)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -10573,6 +10585,53 @@ impl ZhihuApp {
     }
 }
 
+/// Comment body: emoji-aware text plus any images the comment HTML carried.
+///
+/// Zhihu writes comment pictures as `<img>` tags whose alt becomes `[图片]`
+/// in the plain text, so those placeholder lines are dropped and the pictures
+/// are shown as thumbnails underneath instead.
+fn comment_body(content: &str, color: Rgba, border: Rgba) -> AnyElement {
+    let doc = zhihu_content::parse_html(content);
+    let mut images = Vec::new();
+    for block in &doc.blocks {
+        if let Block::Image { src, .. } = block {
+            if !src.is_empty() {
+                images.push(src.clone());
+            }
+        }
+    }
+    let plain: String = zhihu_content::to_plain_text(&doc.blocks)
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed != "图片" && trimmed != "[图片]"
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut body = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(emoji_plain_text(&plain, color, 14.0, 22.0));
+    if !images.is_empty() {
+        let mut row = div().w_full().flex().flex_wrap().gap_2();
+        for url in images {
+            row = row.child(
+                div()
+                    .size(px(96.))
+                    .rounded_md()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(border)
+                    .child(img(url).size(px(96.)).object_fit(ObjectFit::Cover)),
+            );
+        }
+        body = body.child(row);
+    }
+    body.into_any_element()
+}
+
 fn emoji_plain_text(text: &str, color: Rgba, size: f32, line_height: f32) -> AnyElement {
     use emoji::EmojiPiece;
     let pieces = emoji::pieces(text);
@@ -10773,7 +10832,6 @@ fn comment_card(
     border: Rgba,
     accent: Rgba,
 ) -> Div {
-    let plain = zhihu_content::to_plain_text(&zhihu_content::parse_html(&comment.content).blocks);
     let time = format_comment_time(comment.created_time);
     let author_token = comment
         .author
@@ -11085,7 +11143,7 @@ fn comment_card(
         .flex_col()
         .gap_2()
         .child(header)
-        .child(emoji_plain_text(&plain, fg, 14.0, 22.0))
+        .child(comment_body(&comment.content, fg, border))
         .child(footer);
 
     if expanded || !children.is_empty() {
@@ -11189,7 +11247,6 @@ fn child_comment_row(
     highlighted: bool,
     root_id: &str,
 ) -> Div {
-    let plain = zhihu_content::to_plain_text(&zhihu_content::parse_html(&child.content).blocks);
     let author_token = child
         .author
         .url_token
@@ -11472,7 +11529,7 @@ fn child_comment_row(
         .flex_col()
         .gap_1()
         .child(header)
-        .child(emoji_plain_text(&plain, muted, 14.0, 20.0))
+        .child(comment_body(&child.content, muted, muted))
         .child(actions)
 }
 
@@ -11831,7 +11888,10 @@ fn hot_row(
     let weak = entity.clone();
     let query = item.query.clone();
     div()
-        .id(SharedString::from(format!("hot-{}", item.id)))
+        // The hot-search API returns one shared `query_id` for every entry, so
+        // the index has to be part of the element id: duplicate ids share
+        // element state and only the first row stays clickable.
+        .id(SharedString::from(format!("hot-{index}-{}", item.id)))
         .aria_label(item.query.clone())
         .h(px(56.))
         .w_full()
@@ -11938,13 +11998,20 @@ fn feed_card(
     offset: f32,
     wide: bool,
     read: bool,
+    time: String,
 ) -> AnyElement {
     let danger = rgb(0xf6465d);
-    let meta = format!(
+    let mut meta = format!(
         "{} 赞 · {} 评论",
         format_count(item.vote_up_count),
         format_count(item.comment_count)
     );
+    // The feed timeline rides in the same muted row as the counts instead of
+    // taking a left rail of its own.
+    if !time.is_empty() {
+        meta.push_str(" · ");
+        meta.push_str(&time);
+    }
     let kind = item.kind;
     let id = item.id.clone();
     let title = item.title.clone();

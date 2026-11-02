@@ -254,7 +254,17 @@ impl ZhihuApp {
             .map(|item| {
                 let read = self.is_read(item.kind, &item.id);
                 feed_card(
-                    item, &weak, surface, fg, muted, border, accent, 0.0, true, read,
+                    item,
+                    &weak,
+                    surface,
+                    fg,
+                    muted,
+                    border,
+                    accent,
+                    0.0,
+                    true,
+                    read,
+                    String::new(),
                 )
             })
             .collect();

@@ -5,8 +5,8 @@ use gpui_kit::component::input::Input;
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, rgb, uniform_list, Animation, AnimationExt as _, AnyElement, Context, Div,
-    Focusable, FontWeight, MouseButton, Rgba, SharedString, Window,
+    div, img, px, rgb, Animation, AnimationExt as _, AnyElement, Context, Div, Focusable,
+    FontWeight, MouseButton, Rgba, SharedString, Window,
 };
 use zhihu_types::{FeedItem, FollowFeedKind};
 
@@ -80,52 +80,6 @@ fn relative_time_label(timestamp: i64) -> String {
 /// One mobile feed cell on the timeline: a rail with a dot and publish time,
 /// then the card. The rail line bleeds past the row gap so the list reads as
 /// one continuous line while scrolling back through history.
-fn timeline_cell(time: String, read: bool, card: AnyElement, p: Palette) -> AnyElement {
-    div()
-        .w_full()
-        .flex_shrink_0()
-        .flex()
-        .child(
-            div()
-                .relative()
-                .w(px(54.))
-                .flex_shrink_0()
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(26.5))
-                        .top(px(-8.))
-                        .bottom(px(-8.))
-                        .w(px(1.))
-                        .bg(p.border),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .pt_3()
-                        .gap_1()
-                        .child(div().size(px(8.)).rounded_full().bg(if read {
-                            p.muted
-                        } else {
-                            p.accent
-                        }))
-                        .child(
-                            div()
-                                .w_full()
-                                .text_size(px(10.))
-                                .text_color(p.muted)
-                                .text_center()
-                                .child(SharedString::from(time)),
-                        ),
-                ),
-        )
-        .child(div().flex_1().min_w_0().child(card))
-        .into_any_element()
-}
-
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Rgba,
@@ -1162,15 +1116,9 @@ impl ZhihuApp {
                 self.card_offset(&item.id),
                 wide,
                 read,
+                relative_time_label(stamp),
             );
-            // Mobile uses a single column, so every card can hang off a
-            // timeline rail with its publish time; the wide desktop layout
-            // keeps the waterfall grid.
-            columns[column].push(if wide {
-                card
-            } else {
-                timeline_cell(relative_time_label(stamp), read, card, p)
-            });
+            columns[column].push(card);
         }
 
         let mut row = if wide {
@@ -1400,15 +1348,9 @@ impl ZhihuApp {
                 self.card_offset(&item.id),
                 wide,
                 read,
+                relative_time_label(stamp),
             );
-            // Mobile uses a single column, so every card can hang off a
-            // timeline rail with its publish time; the wide desktop layout
-            // keeps the waterfall grid.
-            columns[column].push(if wide {
-                card
-            } else {
-                timeline_cell(relative_time_label(stamp), read, card, p)
-            });
+            columns[column].push(card);
         }
         let mut row = if wide {
             div()
@@ -1538,31 +1480,23 @@ impl ZhihuApp {
             )
             .into_any_element();
         }
-        let count = self.hot.len();
-        let list_id = format!("home-hot-{}", self.list_epoch);
         let entity = cx.entity().downgrade();
-        uniform_list(
-            list_id,
-            count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, _| {
-                let mut rows = Vec::with_capacity(range.len());
-                for index in range {
-                    rows.push(hot_row(
-                        index,
-                        &this.hot[index],
-                        &entity,
-                        p.surface,
-                        p.fg,
-                        p.muted,
-                        p.border,
-                        p.accent,
-                    ));
-                }
-                rows
-            }),
-        )
-        .size_full()
-        .into_any_element()
+        // A plain scroll column rather than `uniform_list`: on Android the
+        // virtualized list's rows never receive the tap, so hot terms looked
+        // dead. The list is capped at 20 items, so there is nothing to
+        // virtualize anyway.
+        let mut column = div()
+            .id(SharedString::from(format!("home-hot-{}", self.list_epoch)))
+            .size_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for (index, item) in self.hot.iter().enumerate() {
+            column = column.child(hot_row(
+                index, item, &entity, p.surface, p.fg, p.muted, p.border, p.accent,
+            ));
+        }
+        column.into_any_element()
     }
 
     fn render_daily_list(&mut self, cx: &mut Context<Self>, p: Palette) -> AnyElement {
