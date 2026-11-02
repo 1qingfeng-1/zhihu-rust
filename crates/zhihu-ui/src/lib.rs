@@ -278,6 +278,22 @@ fn comments_cache_key(kind: ContentKind, id: &str) -> String {
     format!("{kind:?}:{id}")
 }
 
+/// One opened answer/article kept for the session. Re-entering the same
+/// content renders this copy immediately instead of showing the loading state
+/// for another network round trip.
+#[derive(Clone)]
+struct DetailCacheEntry {
+    detail: ContentDetail,
+    blocks: Vec<Block>,
+}
+
+/// How many opened details stay in memory before the cache is dropped.
+const DETAIL_CACHE_LIMIT: usize = 8;
+
+fn detail_cache_key(kind: ContentKind, id: &str) -> String {
+    format!("{}:{id}", kind.as_str())
+}
+
 fn unix_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -837,6 +853,10 @@ pub struct ZhihuApp {
     /// Loaded comment pages by `kind:id:sort`, so re-entering a page shows the
     /// same list without another network round trip. Cleared on refresh.
     comments_cache: HashMap<String, CommentsCacheEntry>,
+    /// Answers/articles opened this session, keyed `kind:id`, so going back
+    /// and re-entering shows the text immediately. Refreshing replaces the
+    /// entry; it is never used to skip an explicit reload.
+    detail_cache: HashMap<String, DetailCacheEntry>,
     /// Feed items the reader has opened (keyed `kind:id`), for gray titles.
     read_ids: HashSet<String>,
     /// When each feed card first appeared, so the mobile timeline is a stable
@@ -1285,6 +1305,7 @@ impl ZhihuApp {
             comments: Vec::new(),
             comment_sort: CommentSort::Default,
             comments_cache: HashMap::new(),
+            detail_cache: HashMap::new(),
             read_ids,
             feed_times: HashMap::new(),
             pending_read: None,
@@ -2909,6 +2930,29 @@ impl ZhihuApp {
         }
     }
 
+    /// Keep the system status bar readable over the surface painted behind
+    /// the safe-area inset. The app draws edge to edge, so the bar has no
+    /// background of its own: its text and icons must contrast with the page
+    /// underneath (light theme paints a near-white background).
+    fn sync_status_bar_style(&self) {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            use gpui_mobile::{StatusBarContentStyle, SystemChromeStyle};
+            // The splash poster and the full-screen image viewer stay dark
+            // in the light theme, so they keep light icons.
+            let light_content = self.dark || self.splash_visible || self.image_view.is_some();
+            gpui_mobile::set_system_chrome(&SystemChromeStyle {
+                status_bar_color: None,
+                status_bar_style: if light_content {
+                    StatusBarContentStyle::Light
+                } else {
+                    StatusBarContentStyle::Dark
+                },
+                navigation_bar_color: None,
+            });
+        }
+    }
+
     /// Whether anything on screen needs the fast tick (animations, loading,
     /// countdowns). Everything else can run on the 1 s idle cadence.
     fn ui_busy(&self) -> bool {
@@ -4360,6 +4404,12 @@ impl ZhihuApp {
             self.show_demo(title, kind);
         } else if !self.services.is_logged_in() {
             self.detail_error = Some("需要登录 Cookie 后才能加载正文".to_string());
+        } else if let Some(entry) = self.detail_cache.get(&detail_cache_key(kind, &id)).cloned() {
+            // Opened before in this session: show it at once, no request and
+            // no loading state. The saved reading progress still applies.
+            self.detail_blocks = entry.blocks;
+            self.detail = Some(entry.detail);
+            self.detail_restore_progress = Some(self.services.read_progress(kind, &id));
         } else {
             self.detail_restore_progress = Some(self.services.read_progress(kind, &id));
             self.detail_loading = true;
@@ -4391,7 +4441,37 @@ impl ZhihuApp {
             self.detail_loading = false;
             self.detail_error = None;
             self.detail_offline = offline;
+            self.remember_detail();
         }
+    }
+
+    /// Keep the just-loaded content for the rest of the session so going back
+    /// and re-entering it is instant. Only answer/article/pin routes qualify:
+    /// the daily reader reuses the same detail fields but has its own route.
+    fn remember_detail(&mut self) {
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        let routed = matches!(
+            self.stack.last(),
+            Some(
+                Route::Answer { id, .. } | Route::Article { id, .. } | Route::Pin { id, .. }
+            ) if *id == detail.id
+        );
+        if !routed {
+            return;
+        }
+        let key = detail_cache_key(detail.kind, &detail.id);
+        if self.detail_cache.len() >= DETAIL_CACHE_LIMIT && !self.detail_cache.contains_key(&key) {
+            self.detail_cache.clear();
+        }
+        self.detail_cache.insert(
+            key,
+            DetailCacheEntry {
+                detail: detail.clone(),
+                blocks: self.detail_blocks.clone(),
+            },
+        );
     }
 
     fn poll_notification_unread(&mut self) {
@@ -5685,6 +5765,7 @@ impl Render for ZhihuApp {
     ) -> impl gpui_kit::IntoElement {
         self.watch_touch_selection(window, cx);
         self.sync_touch_selection(window, cx);
+        self.sync_status_bar_style();
         self.viewport_width = f32::from(window.viewport_size().width);
         self.viewport_height = f32::from(window.viewport_size().height);
         // Start the splash clock with the first painted frame, not with
@@ -10118,8 +10199,20 @@ impl ZhihuApp {
             cx.notify();
             return;
         };
-        speak(&text, &self.tts_options());
+        let started = speak(&text, &self.tts_options());
         self.tts_segment_started = std::time::Instant::now();
+        if !started {
+            // No usable speech engine (or it is still initializing): stop the
+            // player instead of highlighting sentences that never sound.
+            self.tts_playing = false;
+            self.speaking = false;
+            self.show_toast(
+                "系统语音引擎未就绪，请在系统设置中启用或更换文字转语音引擎",
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         self.tts_scroll
             .scroll_to_item(self.tts_index, ScrollStrategy::Center);
         self.speaking = true;

@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 gpui-kit = { workspace = true }
 jieba-rs = { workspace = true }
+log = "0.4"
 ratex-gpui = { workspace = true }
 qrcode = "0.14.1"
 zhihu-content = { path = "../zhihu-content" }

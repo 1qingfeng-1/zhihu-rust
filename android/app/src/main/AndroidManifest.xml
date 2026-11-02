@@ -21,6 +21,15 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Package visibility (Android 11+): TextToSpeech binds to the installed
+         engine by package, so the engine must stay visible to this app.
+         Without this, TextToSpeech init fails with ERROR on API 30+. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <!-- Network / connectivity permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -28,6 +37,10 @@
 
     <!-- Vibration permission -->
     <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- Volume keys are handled in-app (NativeActivity consumes them), so the
+         app needs the normal audio-settings permission to change the stream. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <!-- Notification permission (required on Android 13+ / API 33+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />

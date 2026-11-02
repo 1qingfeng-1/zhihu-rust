@@ -226,6 +226,34 @@ pub fn find_app_class<'local>(
     Ok(unsafe { jni::objects::JClass::from_raw(env, loaded.as_raw()) })
 }
 
+/// Adjust the system volume for a hardware volume key.
+///
+/// NativeActivity delivers key events to the native input queue, so the
+/// Java `dispatchKeyEvent` override never sees the hardware volume keys.
+/// Forward them to the host's `GpuiTts.adjustVolume` so the keys keep
+/// changing the system stream and showing the volume panel inside the app.
+pub fn adjust_system_volume(direction: i32) {
+    let result = with_env(|env| {
+        let class = find_app_class(env, "dev.gpui.mobile.GpuiTts")?;
+        env.call_static_method(
+            &class,
+            jni::jni_str!("adjustVolume"),
+            jni::jni_sig!("(I)V"),
+            &[JValue::Int(direction)],
+        )
+        .map_err(|error| {
+            env.exception_describe();
+            env.exception_clear();
+            error.to_string()
+        })?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => log::debug!("adjust_system_volume({direction}) ok"),
+        Err(error) => log::warn!("adjust_system_volume({direction}) failed: {error}"),
+    }
+}
+
 // ── global state ─────────────────────────────────────────────────────────────
 
 /// The `AndroidApp` handle from `android-activity`.
@@ -643,6 +671,23 @@ fn process_input_events(app: &AndroidApp) {
                             };
 
                             let key_code: u32 = key_event.key_code().into();
+
+                            // Hardware volume keys arrive here, bypassing the
+                            // Java key dispatch; route them to the host so they
+                            // still change the system volume (and show the
+                            // system volume panel) inside the app.
+                            let volume_direction = match key_code as i32 {
+                                24 => Some(1),    // AKEYCODE_VOLUME_UP
+                                25 => Some(-1),   // AKEYCODE_VOLUME_DOWN
+                                164 => Some(101), // AKEYCODE_VOLUME_MUTE
+                                _ => None,
+                            };
+                            if let Some(direction) = volume_direction {
+                                if action == 0 {
+                                    adjust_system_volume(direction);
+                                }
+                                return android_activity::InputStatus::Handled;
+                            }
                             let meta_state: u32 = key_event.meta_state().0;
 
                             let unicode_char = unicode_char_for_key_event(

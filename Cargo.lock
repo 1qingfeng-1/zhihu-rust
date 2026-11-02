@@ -10494,6 +10494,7 @@ dependencies = [
  "gpui-mobile",
  "jieba-rs",
  "jni",
+ "log",
  "qrcode",
  "ratex-gpui",
  "zhihu-content",

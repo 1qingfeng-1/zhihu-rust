@@ -33,39 +33,48 @@ impl Default for TtsOptions {
 }
 
 #[cfg(target_os = "android")]
-pub fn speak(text: &str, options: &TtsOptions) {
+const TTS_CLASS: &str = "dev.gpui.mobile.GpuiTts";
+
+/// Speak `text`. Returns whether the platform speech engine accepted it, so
+/// the reader can tell the user when no engine is available instead of
+/// silently highlighting sentences.
+#[cfg(target_os = "android")]
+pub fn speak(text: &str, options: &TtsOptions) -> bool {
     use jni::objects::JValue;
-    let _ = gpui_mobile::android::jni::with_env(|env| {
-        let class = env
-            .find_class(jni::jni_str!("dev/gpui/mobile/GpuiTts"))
-            .map_err(|error| error.to_string())?;
+    gpui_mobile::android::jni::with_env(|env| {
+        // Native threads resolve `FindClass` through the system loader, which
+        // cannot see app classes; go through the Activity's loader.
+        let class = gpui_mobile::android::jni::find_app_class(env, TTS_CLASS)?;
         let text = env.new_string(text).map_err(|error| error.to_string())?;
         let voice = env
             .new_string(&options.voice)
             .map_err(|error| error.to_string())?;
-        env.call_static_method(
-            &class,
-            jni::jni_str!("speak"),
-            jni::jni_sig!("(Ljava/lang/String;FFFLjava/lang/String;)V"),
-            &[
-                JValue::Object(&text),
-                JValue::Float(options.rate),
-                JValue::Float(options.pitch),
-                JValue::Float(options.volume),
-                JValue::Object(&voice),
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
-    });
+        let queued = env
+            .call_static_method(
+                &class,
+                jni::jni_str!("speak"),
+                jni::jni_sig!("(Ljava/lang/String;FFFLjava/lang/String;)Z"),
+                &[
+                    JValue::Object(&text),
+                    JValue::Float(options.rate),
+                    JValue::Float(options.pitch),
+                    JValue::Float(options.volume),
+                    JValue::Object(&voice),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(queued.z().unwrap_or(false))
+    })
+    .unwrap_or_else(|error| {
+        log::warn!("tts speak failed: {error}");
+        false
+    })
 }
 
 #[cfg(target_os = "android")]
 pub fn stop_speaking() {
     let _ = gpui_mobile::android::jni::with_env(|env| {
-        let class = env
-            .find_class(jni::jni_str!("dev/gpui/mobile/GpuiTts"))
-            .map_err(|error| error.to_string())?;
+        let class = gpui_mobile::android::jni::find_app_class(env, TTS_CLASS)?;
         env.call_static_method(&class, jni::jni_str!("stop"), jni::jni_sig!("()V"), &[])
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -75,9 +84,7 @@ pub fn stop_speaking() {
 #[cfg(target_os = "android")]
 pub fn is_speaking() -> bool {
     gpui_mobile::android::jni::with_env(|env| {
-        let class = env
-            .find_class(jni::jni_str!("dev/gpui/mobile/GpuiTts"))
-            .map_err(|error| error.to_string())?;
+        let class = gpui_mobile::android::jni::find_app_class(env, TTS_CLASS)?;
         let value = env
             .call_static_method(
                 &class,
@@ -92,7 +99,9 @@ pub fn is_speaking() -> bool {
 }
 
 #[cfg(target_os = "ios")]
-pub fn speak(_text: &str, _options: &TtsOptions) {}
+pub fn speak(_text: &str, _options: &TtsOptions) -> bool {
+    false
+}
 
 #[cfg(target_os = "ios")]
 pub fn is_speaking() -> bool {
@@ -114,10 +123,10 @@ mod desktop {
 
     /// Speak `text` with the system voice. A previous utterance is stopped
     /// first so the reader never overlaps itself.
-    pub fn speak(text: &str, options: &TtsOptions) {
+    pub fn speak(text: &str, options: &TtsOptions) -> bool {
         stop_speaking();
         if text.trim().is_empty() {
-            return;
+            return false;
         }
 
         let mut command = speech_command(options);
@@ -133,8 +142,12 @@ mod desktop {
                 if let Ok(mut slot) = SPEECH.lock() {
                     *slot = Some(child);
                 }
+                true
             }
-            Err(error) => eprintln!("failed to start desktop TTS: {error}"),
+            Err(error) => {
+                eprintln!("failed to start desktop TTS: {error}");
+                false
+            }
         }
     }
 
