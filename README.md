@@ -5,6 +5,8 @@
 参考实现：[zly2006/zhihu-plus-plus](https://github.com/zly2006/zhihu-plus-plus)（Kotlin Multiplatform / Compose）。
 本仓库由 [1qingfeng-1/template](https://github.com/1qingfeng-1/template) 初始化。
 
+当前版本：**v1.0.0**（2026-11-02 首个公开版本，Android arm64 与 Windows / Linux 桌面）。
+
 ## 状态
 
 **M0 已完成（GO）**：桌面与 Android 真机可运行，中文渲染、虚拟列表、触摸滚动、主题切换、软键盘输入、安全区均已验证。

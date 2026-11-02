@@ -10380,7 +10380,7 @@ dependencies = [
 
 [[package]]
 name = "zhihu-api"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -10399,7 +10399,7 @@ dependencies = [
 
 [[package]]
 name = "zhihu-content"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "scraper",
  "thiserror 2.0.21",
@@ -10409,7 +10409,7 @@ dependencies = [
 
 [[package]]
 name = "zhihu-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -10429,7 +10429,7 @@ dependencies = [
 
 [[package]]
 name = "zhihu-desktop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "embed-resource",
  "gpui-kit",
@@ -10440,7 +10440,7 @@ dependencies = [
 
 [[package]]
 name = "zhihu-mobile"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -10456,11 +10456,11 @@ dependencies = [
 
 [[package]]
 name = "zhihu-platform"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "zhihu-recommend"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ort",
  "tokenizers",
@@ -10469,7 +10469,7 @@ dependencies = [
 
 [[package]]
 name = "zhihu-store"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -10480,14 +10480,14 @@ dependencies = [
 
 [[package]]
 name = "zhihu-types"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "zhihu-ui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "dirs 6.0.0",
  "gpui-kit",
