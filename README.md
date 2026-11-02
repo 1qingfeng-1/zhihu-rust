@@ -168,7 +168,7 @@ cargo run -p zhihu-desktop
 cargo build --release -p zhihu-desktop
 ```
 
-产物：`target/release/zhihu-desktop.exe`（单文件，无需安装）。
+产物：`target/release/zhihu-desktop.exe`（与 VC++ 运行库 DLL 放在同一目录即可运行，无需安装）。
 数据目录：`%APPDATA%\zhihu-rust`；可用 `ZHIHU_DATA_DIR` 覆盖。
 本仓库同时提供打包好的目录与 zip：
 

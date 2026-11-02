@@ -91,8 +91,9 @@ rm -f android/app/src/main/jniLibs/arm64-v8a/libgpui_mobile.so
 (cd android && cmd //c ".\\gradlew.bat assembleRelease --no-daemon")
 
 cargo build --release -p zhihu-desktop
-# Windows 便携版（静态 C 运行库，不依赖 VCRUNTIME140.dll）：
-# RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p zhihu-desktop
+# Windows 便携版：预编译 ONNX Runtime 静态库依赖动态 MSVC 运行库，
+# 因此不能使用 `-C target-feature=+crt-static`；发布包中随 exe 附带
+# msvcp140.dll / vcruntime140.dll / vcruntime140_1.dll。
 ```
 
 产物：

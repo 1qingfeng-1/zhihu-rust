@@ -88,7 +88,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: zhihu-desktop-windows-x64.zip
-            rustflags: "-C target-feature=+crt-static"
+            rustflags: ""
           - os: ubuntu-latest
             artifact: zhihu-desktop-linux-x64.tar.gz
             rustflags: ""
@@ -115,7 +115,17 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path target/release/zhihu-desktop.exe `
+          # The prebuilt ONNX Runtime static libraries link against the
+          # dynamic MSVC runtime, so a +crt-static binary cannot link.
+          # Ship the redistributable DLLs next to the exe instead.
+          $pkg = Join-Path $env:RUNNER_TEMP "pkg"
+          New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+          Copy-Item target/release/zhihu-desktop.exe $pkg
+          foreach ($dll in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
+            $source = Join-Path $env:SystemRoot "System32\$dll"
+            if (Test-Path $source) { Copy-Item $source $pkg }
+          }
+          Compress-Archive -Path "$pkg\*" `
             -DestinationPath "${{ runner.temp }}/${{ matrix.artifact }}"
       - name: Package (Linux)
         if: runner.os == 'Linux'

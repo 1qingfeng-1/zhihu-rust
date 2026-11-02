@@ -172,6 +172,7 @@ mod desktop {
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn escape_single_quotes(value: &str) -> String {
         value.replace('\'', "''")
     }
