@@ -32,6 +32,14 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig1-dev libasound2-dev libvulkan-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev
       - name: Check code format
         run: cargo fmt -- --check
       - name: Check the package for errors
